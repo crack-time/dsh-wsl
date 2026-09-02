@@ -1,31 +1,10 @@
-# @crack/dsh-wsl activation rows.
+# @crack/dsh-wsl activation row.
 #
-# This bundle swaps the Windows pwsh shell for a WSL remote bash executor
-# ("remote-connection experience"): the model's `bash` tool runs inside a WSL
-# distro while the DSH host keeps running natively on Windows.
-#
-# Merge these rows into the profile cordis.patch.yml (e.g.
-# C:\Users\crack\.dsh\profiles\web\cordis.patch.yml). The bare `- id:` entries
-# are id-targeted overrides of the rows the shared dsh-base bundle inserted
-# (last write wins); the trailing `insert:` mounts the executor as ctx.shell.
-# Requires the @crack/dsh-wsl package to be installed (link:) so the row's
-# `name` resolves.
-
-# Steal the executor seam: put the Windows pwsh-sandbox executor to sleep so
-# the WSL executor below becomes the single ctx.shell provider.
-- id: pwsh-sandbox
-  disabled: true
-
-# Present the model-facing `bash` tool (Windows defaults to the pwsh tool).
-- id: tool-pwsh
-  disabled: true
-- id: tool-bash
-  disabled: false
-
-# Mount the WSL executor as ctx.shell. Set `distro` to your WSL distro
-# (wsl -l) or leave it unset to use the default distro.
+# Mount the WSL workspace plugin in a profile. The host half registers the
+# WSL workspace browser API and the client half seats a "＋ WSL 工作区" button
+# in the sidebar. Merge this row into the profile cordis.patch.yml (e.g.
+# C:\Users\crack\.dsh\profiles\web\cordis.patch.yml). The @crack/dsh-wsl
+# package must be installed (link:) so the row's `name` resolves.
 - insert:
     - id: wsl
       name: '@crack/dsh-wsl'
-      config:
-        distro: 'Ubuntu-22.04'

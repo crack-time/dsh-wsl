@@ -1,290 +1,246 @@
 /**
- * @crack/dsh-wsl — host-only executor plugin.
+ * @crack/dsh-wsl — host loader entry.
  *
- * Replaces the Windows shell executor (pwsh-sandbox) with a WSL-forwarding
- * bash executor: the model's `bash` tool runs inside a WSL distro — the
- * remote-connection experience — while the DSH host keeps running natively
- * on Windows (file tools, web UI, persistence untouched; the Windows-side
- * session workspace is reached from Linux through /mnt/<drive>/...).
+ * Lets an operator register a workspace *inside a WSL distro* into DSH's
+ * native workspace registry. The directory stays on the Linux filesystem;
+ * from the Windows host it is owned through its UNC share
+ * `\\wsl.localhost\<distro>\<linux-path>`, so it is a completely ordinary
+ * workspace record: the sidebar already lists every registry entry, so the
+ * WSL workspace appears beside Windows workspaces and is session-attached,
+ * opened, and persisted exactly like any other.
  *
- * How: subclass LocalBashExecutor at its documented execution boundary (its
- * runArgv/startArgv exist so subclasses can "replace the public command's
- * shell argv") and rewrite the argv to
+ * This host half exposes a small JSON API under
+ *   /plugins/@crack/dsh-wsl/api
+ * that the client browser uses to enumerate distros, walk the Linux
+ * filesystem, create a folder, and finally register a directory. Only the
+ * final registration touches the registry; listing/creation shells out to
+ * `wsl.exe` (the host runs in the full Node process, unsandboxed, so the WSL
+ * service is reachable).
  *
- *   wsl.exe [-d <distro>] --cd <posix workdir> -- bash [-l] -c <command>
- *
- * Windows workdirs are translated (E:\x → /mnt/e/x, \\wsl.localhost\D\h\y →
- * /y); spec env and DSH_* variables are re-exported inside the Linux shell
- * because wsl.exe does not forward the parent environment.
- *
- * Composition (rows the installer adds to the profile cordis.patch.yml):
- *
- *   - id: pwsh-sandbox
- *     disabled: true
- *   - id: tool-pwsh
- *     disabled: true
- *   - id: tool-bash
- *     disabled: false
- *   - insert:
- *       - id: wsl
- *         name: '@crack/dsh-wsl'
- *         config:
- *           distro: Ubuntu-22.04
- *
- * The base class import resolves against the RUNNING dsh install (same file
- * URL → the exact ESM module instance the host already loaded), so there is
- * no version drift and no runtime dependency to install.
+ * The client half (src/client) injects a "＋ WSL 工作区" button next to the
+ * native Add-workspace button in the sidebar and opens this browser.
  */
-import { createRequire } from 'node:module';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import type { Context } from '@deepseek-ai/cordis';
+import { execFile as execFileCb } from 'node:child_process'
+import { promisify } from 'node:util'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Context } from '@deepseek-ai/cordis'
+// Type-only imports load the cordis Context declaration-merges:
+// webServer (dsh-host-webserver), workspaceRegistry (dsh-workspace).
+import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 
-//#region base-class resolution
+const execFile = promisify(execFileCb)
 
-/**
- * Resolve `name` inside the dsh install that is loading this plugin.
- *
- * The plugin itself is loaded from a link: directory outside any node_modules
- * that carries @deepseek-ai packages, so bare-specifier resolution fails.
- * Anchor on the host's own entry script (the global npm launcher layout) and
- * fall back to the standard Windows global install location — the resolved
- * file URL equals the one the host already imported, so the ESM cache returns
- * the same class identity.
- */
-function resolveDshPackage(name: string): string {
-    const attempts: string[] = [];
-    const anchors = [process.argv[1], path.join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')]
-        .filter((anchor): anchor is string => typeof anchor === 'string' && anchor.length > 0);
-    for (const anchor of anchors) {
-        try {
-            return createRequire(anchor).resolve(name);
-        } catch (error) {
-            attempts.push(`${anchor}: ${error instanceof Error ? error.message : String(error)}`);
-        }
-    }
-    throw new Error(
-        `@crack/dsh-wsl: cannot locate ${name} from the running dsh install. `
-        + `Tried:\n${attempts.join('\n')}`,
-    );
+const API_PREFIX = '/plugins/@crack/dsh-wsl/api'
+
+const inject = ['webServer', 'workspaceRegistry']
+
+// ---------------------------------------------------------------------------
+// JSON response helpers
+// ---------------------------------------------------------------------------
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body)
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(text)
 }
 
-//#endregion
-//#region local structural types for the (type-less) base class
-
-/** Resolved execution settings handed to run/start by the caller. */
-interface ShellSpec {
-    command: string;
-    workdir?: string;
-    timeoutMs: number;
-    stdoutMaxBytes: number;
-    signal?: AbortSignal;
-    stdin?: { data: string };
-    env?: Record<string, string | undefined>;
-    dshEnv?: Record<string, string | undefined>;
-    sandboxPolicy?: unknown;
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = ''
+    req.on('data', (chunk) => {
+      data += String(chunk)
+      if (data.length > 1_000_000) {
+        reject(Object.assign(new Error('request body too large'), { code: 413 }))
+        req.destroy()
+      }
+    })
+    req.on('end', () => resolve(data))
+    req.on('error', reject)
+  })
 }
 
-/** One collected output stream. */
-interface StreamOutput {
-    text: string;
-    truncated: boolean;
-    spillPath?: string;
+function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return readBody(req)
+    .then((raw) => {
+      if (!raw) return {}
+      try {
+        return JSON.parse(raw) as Record<string, unknown>
+      } catch (error) {
+        const e = error instanceof Error ? error : new Error(String(error))
+        throw Object.assign(e, { code: 400 })
+      }
+    })
 }
 
-/** Foreground run outcome (subset the executor contract guarantees). */
-interface ShellRunResult {
-    exitCode: number | null;
-    signal: string | null;
-    timedOut: boolean;
-    aborted: boolean;
-    timeoutMs: number;
-    stdout: StreamOutput;
-    stderr: StreamOutput;
-}
-
-/** Background process handle (subset). */
-interface ShellProcess {
-    status: 'running' | 'completed' | 'killed';
-    done: Promise<unknown>;
-    readOutput(): { delta: string; lossy: boolean };
-    kill(): boolean;
-}
-
-/** Executor configuration: the base class's numeric/cwd plumbing plus ours. */
-interface WslExecutorConfig {
-    cwd?: string;
-    timeoutMs?: number;
-    maxTimeoutMs?: number;
-    maxOutputBytes?: number;
-    maxSpillBytes?: number;
-    graceMs?: number;
-    distro?: string;
-    login?: boolean;
-}
-
-/** The members of LocalBashExecutor this plugin touches. */
-interface LocalBashExecutorLike {
-    readonly config: WslExecutorConfig;
-    ctx: unknown;
-    resolve(request: Partial<ShellSpec> & { command: string }): ShellSpec;
-    run(spec: ShellSpec): Promise<ShellRunResult>;
-    start(spec: ShellSpec): ShellProcess;
-    runArgv(spec: ShellSpec, argv: string[]): Promise<ShellRunResult>;
-    startArgv(spec: ShellSpec, argv: string[]): ShellProcess;
-}
-
-interface LocalBashExecutorCtor {
-    prototype: LocalBashExecutorLike;
-    new (ctx: unknown, config: WslExecutorConfig): LocalBashExecutorLike;
-}
-
-//#endregion
-//#region WSL-side helpers
-
-/** Keys eligible for the in-shell `export` prefix; anything else is skipped. */
-const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** Single-quote a value for POSIX shell consumption. */
+// ---------------------------------------------------------------------------
+// wsl.exe plumbing (runs in the full Node host)
+// ---------------------------------------------------------------------------
 function shellQuote(value: string): string {
-    return `'${value.replaceAll("'", `'\\''`)}'`;
+  return `'${value.replaceAll("'", `'\\''`)}'`
 }
 
-/**
- * Translate a Windows-side directory into the path the Linux side should use.
- *
- * - drive paths → /mnt/<drive>/... (E:\work → /mnt/e/work, E:/x → /mnt/e/x)
- * - WSL UNC paths (\\wsl.localhost\<distro>\... and \\wsl$\<distro>\...)
- *   → the in-distro absolute path; a UNC pointing at a different distro than
- *   the configured one surfaces as a plain "no such directory" from bash
- * - already-POSIX paths and relative paths pass through unchanged
- */
-function toWslPath(workdir: string): string {
-    if (workdir.startsWith('/')) return workdir;
-    const windows = workdir.replaceAll('/', '\\');
-    const unc = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)\\(.*)$/i.exec(windows);
-    if (unc) {
-        const inside = unc[2] ?? '';
-        return `/${inside.replaceAll('\\', '/')}`;
-    }
-    const drive = /^([A-Za-z]):\\(.*)$/.exec(windows);
-    if (drive) {
-        const rest = drive[2] ?? '';
-        return `/mnt/${(drive[1] as string).toLowerCase()}/${rest.replaceAll('\\', '/')}`;
-    }
-    const bareDrive = /^([A-Za-z]):$/.exec(windows);
-    if (bareDrive) return `/mnt/${(bareDrive[1] as string).toLowerCase()}`;
-    return workdir;
+/** Run one command inside a distro's default shell; resolves with stdout. */
+async function wslBash(distro: string, script: string): Promise<string> {
+  const { stdout } = await execFile('wsl.exe', ['-d', distro, '--', 'bash', '-lc', script], {
+    encoding: 'utf8',
+    windowsHide: true,
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 30_000,
+  })
+  return stdout
 }
 
-/**
- * Build the string handed to `bash -c` inside WSL: an `export`/`unset`
- * prefix that re-creates the model-friendly and DSH_* environment (wsl.exe
- * does not forward the parent environment), then the caller's command.
- * Caller entries win over the model-friendly defaults, DSH_* entries win
- * over both — the same precedence the base class applies on the Windows side.
- */
-function wslCommand(spec: ShellSpec, modelFriendlyEnv: Record<string, string>): string {
-    const lines: string[] = [];
-    const merged: Record<string, string | undefined> = { ...modelFriendlyEnv, ...spec.env, ...spec.dshEnv };
-    for (const [key, value] of Object.entries(merged)) {
-        if (!ENV_KEY_RE.test(key)) continue;
-        if (value === undefined) {
-            lines.push(`unset ${key}`);
-        } else {
-            lines.push(`export ${key}=${shellQuote(value)}`);
-        }
-    }
-    lines.push(spec.command);
-    return lines.join('\n');
+/** Enumerate installed WSL distros (order preserved; defaults first). */
+async function listDistros(): Promise<string[]> {
+  const { stdout } = await execFile('wsl.exe', ['-l', '-q'], {
+    encoding: 'utf8',
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+    timeout: 15_000,
+  })
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line !== '*')
 }
 
-//#endregion
-//#region the executor
-
-// Same-module-instance import of the base class (see resolveDshPackage).
-const bashLocal = (await import(pathToFileURL(resolveDshPackage('@deepseek-ai/dsh-bash-local')).href)) as {
-    LocalBashExecutor: LocalBashExecutorCtor;
-    ENV_OVERRIDES: Record<string, string>;
-};
-
-/**
- * WSL bash executor. Registers as `ctx.shell`; pair with the re-enabled
- * `tool-bash` row so the model writes bash and every command lands in the
- * distro. The base class keeps deadlines, bounded output, spill files, and
- * the background-process lifecycle; only the argv changes.
- */
-class WslBashExecutor extends bashLocal.LocalBashExecutor {
-    declare readonly config: WslExecutorConfig;
-
-    constructor(ctx: Context, config: WslExecutorConfig) {
-        super(ctx, config);
-        try {
-            // Best-effort model awareness: tell the agent its shell is Linux.
-            const anyCtx = ctx as unknown as {
-                logger?(label: string): { info(message: string): void };
-                inject?(deps: string[], cb: (scoped: unknown) => void): void;
-            };
-            anyCtx.logger?.('dsh-wsl')?.info(`bash tool executes inside WSL${this.wslDistro ? ` (${this.wslDistro})` : ' (default distro)'}`);
-            anyCtx.inject?.(['systemPrompt'], (scoped: unknown) => {
-                try {
-                    const sp = scoped as {
-                        systemPrompt: {
-                            getSectionOrder(name: string): number;
-                            section(section: { name: string; order: number; text: string }): unknown;
-                        };
-                    };
-                    sp.systemPrompt.section({
-                        name: 'wsl-remote',
-                        order: sp.systemPrompt.getSectionOrder('TOOL_BASH'),
-                        text: 'Bash commands execute inside WSL (Linux): Windows workspace paths appear under /mnt/<drive>/ '
-                            + '(e.g. E:\\work → /mnt/e/work). Use POSIX paths and Linux tooling in commands; '
-                            + 'when you need the Windows view of the workspace, the file tools still take Windows paths.',
-                    });
-                } catch {
-                    // The prompt section is best-effort; execution does not depend on it.
-                }
-            });
-        } catch {
-            // Environment description is best-effort; never block activation.
-        }
-    }
-
-    /** Distro selection: env override, then composition config; absent → wsl.exe default. */
-    private get wslDistro(): string | undefined {
-        const fromEnv = process.env.DSH_WSL_DISTRO?.trim();
-        return fromEnv || this.config.distro?.trim() || undefined;
-    }
-
-    private get loginShell(): boolean {
-        return this.config.login === true;
-    }
-
-    /** The rewritten argv: same spec semantics, remote execution boundary. */
-    private wslArgv(spec: ShellSpec): string[] {
-        const argv = ['wsl.exe'];
-        const distro = this.wslDistro;
-        if (distro) argv.push('-d', distro);
-        argv.push('--cd', toWslPath(spec.workdir ?? this.config.cwd ?? process.cwd()));
-        // --exec, not `--`: the plain `--` form joins the tail into one line
-        // and re-parses it through the distro's default shell, which shreds a
-        // multi-line `bash -c` script (the export prefix especially). --exec
-        // hands the tail to execve argument-by-argument, untouched.
-        argv.push('--exec', 'bash');
-        if (this.loginShell) argv.push('-l');
-        argv.push('-c', wslCommand(spec, bashLocal.ENV_OVERRIDES));
-        return argv;
-    }
-
-    override async run(spec: ShellSpec): Promise<ShellRunResult> {
-        return this.runArgv(spec, this.wslArgv(spec));
-    }
-
-    override start(spec: ShellSpec): ShellProcess {
-        return this.startArgv(spec, this.wslArgv(spec));
-    }
+/** The distro's default user home (Linux path), e.g. /home/crack. */
+async function distroHome(distro: string): Promise<string> {
+  return (await wslBash(distro, `printf %s "$HOME"`)).trim()
 }
 
-//#endregion
+/** Translate a Linux path under a distro into its Windows UNC share path. */
+function toUnc(distro: string, linuxPath: string): string {
+  const p = `/${linuxPath.replace(/^\/+/, '').replace(/\/+$/, '')}`
+  const win = p.split('/').filter(Boolean).join('\\')
+  return `\\\\wsl.localhost\\${distro}\\${win}`
+}
 
-export { WslBashExecutor, WslBashExecutor as default, toWslPath, wslCommand };
+// ---------------------------------------------------------------------------
+// API handler
+// ---------------------------------------------------------------------------
+interface DirEntry {
+  name: string
+  linuxPath: string
+  isDir: boolean
+  hidden: boolean
+}
+
+async function handleApi(
+  ctx: { workspaceRegistry: WorkspaceRegistry },
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const reqUrl = req.url ?? '/'
+  const url = new URL(reqUrl, 'http://localhost')
+  const route = url.pathname.slice(API_PREFIX.length).replace(/\/+$/, '') || '/'
+
+  if (req.method === 'GET' && route === '/distros') {
+    try {
+      const distros = await listDistros()
+      sendJson(res, 200, { distros })
+    } catch (error) {
+      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
+    }
+    return
+  }
+
+  if (req.method === 'POST' && route === '/home') {
+    const body = await readJson(req)
+    const distro = String(body.distro ?? '')
+    if (!distro) return sendJson(res, 400, { error: 'distro required' })
+    try {
+      const home = await distroHome(distro)
+      sendJson(res, 200, { home })
+    } catch (error) {
+      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
+    }
+    return
+  }
+
+  if (req.method === 'POST' && route === '/list') {
+    const body = await readJson(req)
+    const distro = String(body.distro ?? '')
+    const path = String(body.path ?? '')
+    if (!distro || !path) return sendJson(res, 400, { error: 'distro and path required' })
+    try {
+      const out = await wslBash(distro, `ls -1ap -- ${shellQuote(path)}`)
+      const entries: DirEntry[] = []
+      for (const raw of out.split(/\r?\n/)) {
+        const line = raw.replace(/\r$/, '')
+        if (!line || line === '.' || line === '..') continue
+        const isDir = line.endsWith('/')
+        const name = isDir ? line.slice(0, -1) : line
+        const linuxPath = `${path.replace(/\/+$/, '')}/${name}`
+        entries.push({ name, linuxPath, isDir, hidden: name.startsWith('.') })
+      }
+      entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1))
+      sendJson(res, 200, { path, entries })
+    } catch (error) {
+      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
+    }
+    return
+  }
+
+  if (req.method === 'POST' && route === '/create') {
+    const body = await readJson(req)
+    const distro = String(body.distro ?? '')
+    const path = String(body.path ?? '')
+    const name = String(body.name ?? '')
+    if (!distro || !path || !name) return sendJson(res, 400, { error: 'distro, path and name required' })
+    if (name === '.' || name === '..' || /[/\\]/.test(name)) {
+      return sendJson(res, 400, { error: 'name must be a single path segment' })
+    }
+    try {
+      await wslBash(distro, `mkdir -p -- ${shellQuote(path.replace(/\/+$/, '') + '/' + name)}`)
+      sendJson(res, 200, { ok: true })
+    } catch (error) {
+      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
+    }
+    return
+  }
+
+  if (req.method === 'POST' && route === '/register') {
+    const body = await readJson(req)
+    const distro = String(body.distro ?? '')
+    const path = String(body.path ?? '')
+    const title = typeof body.title === 'string' && body.title ? body.title : undefined
+    if (!distro || !path) return sendJson(res, 400, { error: 'distro and path required' })
+    try {
+      const unc = toUnc(distro, path)
+      const registry = ctx.workspaceRegistry
+      const existing = await registry.resolveByPath(unc)
+      const workspace = existing ?? await registry.create(unc, title)
+      sendJson(res, 200, {
+        workspace: {
+          workspaceId: workspace.id,
+          path: workspace.path,
+          title: workspace.title,
+          sessionIds: [...workspace.sessionIds],
+          createdAt: workspace.createdAt,
+          updatedAt: workspace.updatedAt,
+        },
+      })
+    } catch (error) {
+      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
+    }
+    return
+  }
+
+  sendJson(res, 404, { error: `unknown route ${route}` })
+}
+
+/** Host apply: register the WSL workspace browser API. */
+async function apply(ctx: Context): Promise<void> {
+  ctx.webServer.register({
+    kind: 'prefix',
+    path: API_PREFIX,
+    handler: (req, res) => {
+      void handleApi(ctx as Context & { workspaceRegistry: WorkspaceRegistry }, req, res)
+    },
+  })
+  ctx.logger?.('dsh-wsl')?.info(`WSL workspace API mounted at ${API_PREFIX}`)
+}
+
+export { apply, inject }
+export type { DirEntry }
