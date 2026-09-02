@@ -1,6 +1,6 @@
 {
   "name": "@crack/dsh-wsl",
-  "description": "WSL workspace plugin for DSH web: lets an operator register a workspace inside a WSL distro into DSH's native workspace registry (owned through its \\wsl.localhost UNC share), so it appears in the sidebar mixed with Windows workspaces. A \"＋ WSL 工作区\" button in the sidebar opens a browser to pick a distro, walk the Linux filesystem, create a folder, and register it.",
+  "description": "WSL workspace plugin for DSH web: lets an operator register a workspace inside a WSL distro into DSH's native workspace registry (owned through its \\wsl.localhost UNC share), so it appears in the sidebar mixed with Windows workspaces. A \"＋ WSL 工作区\" button in the sidebar opens a browser to pick a distro, walk the Linux filesystem, create a folder, and register it. The @crack/dsh-wsl/tool subpath hosts a WSL shell tool used by the standard-wsl agent preset to run commands in the distro without touching ctx.shell.",
   "version": "0.1.0",
   "type": "module",
   "main": "lib/index.js",
@@ -14,9 +14,9 @@
       "types": "./lib/types/client/index.d.ts",
       "default": "./lib/client.js"
     },
-    "./executor": {
-      "types": "./lib/types/executor.d.ts",
-      "default": "./lib/executor.js"
+    "./tool": {
+      "types": "./lib/types/tool.d.ts",
+      "default": "./lib/tool.js"
     },
     "./package.json": "./package.json"
   },
@@ -36,7 +36,7 @@
     "lib/client.js",
     "lib/client.js.map",
     "lib/index.js",
-    "lib/executor.js",
+    "lib/tool.js",
     "lib/types",
     "cordis.patch.yml"
   ],
@@ -44,6 +44,9 @@
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-host-webserver": "0.1.2-alpha.4",
     "@deepseek-ai/dsh-workspace": "0.1.2-alpha.4",
+    "@deepseek-ai/dsh-tools": "0.1.2-alpha.4",
+    "@deepseek-ai/dsh-shell": "0.1.2-alpha.4",
+    "@deepseek-ai/dsh-subprocess": "0.1.2-alpha.4",
     "@types/node": "^26.2.0",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",

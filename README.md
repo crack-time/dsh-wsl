@@ -1,35 +1,56 @@
-# @crack/dsh-wsl — WSL remote shell executor for DSH
+# @crack/dsh-wsl — WSL workspaces for DSH web
 
-A host-only DeepSeek Harness plugin that replaces the Windows PowerShell shell
-with a **WSL remote bash executor**. The model's `bash` tool runs inside a WSL
-distro — a "remote-connection" experience — while the DSH host keeps running
-natively on Windows (file tools, web UI, and persistence are untouched; the
-Windows session workspace is reached from Linux through `/mnt/<drive>/...`).
+A DeepSeek Harness plugin that lets you **create / register workspaces on the
+WSL Linux filesystem** and have them appear in the dsh sidebar mixed with
+native Windows workspaces. Commands in a WSL workspace run *inside the distro*
+via a purpose-built `wsl` tool — without replacing the host's single
+`ctx.shell` provider.
 
-## How it works
+## Two concerns, two mechanisms
 
-`dsh-wsl` subclasses `LocalBashExecutor` at its documented execution boundary
-(`runArgv` / `startArgv`) and rewrites the argv to:
+### 1. Workspace browser (host + client)
+
+Registers a directory owned through its `\\wsl.localhost\<distro>\<path>` UNC
+share as a completely ordinary workspace record in the native registry, so the
+sidebar already lists it beside Windows workspaces and it is session-attached,
+opened, and persisted like any other.
+
+- Host: a small JSON API under `/plugins/@crack/dsh-wsl/api` (enumerate
+  distros, walk the Linux filesystem, create a folder, register). Only the
+  final registration touches `workspaceRegistry`; listing/creation shells out
+  to `wsl.exe`.
+- Client: a "＋ WSL 工作区" entry next to the native Add-workspace button opens
+  a browser to pick a distro and a directory (starting from the distro's home),
+  then registers it.
+
+### 2. WSL shell tool (`@crack/dsh-wsl/tool`) + `standard-wsl` preset
+
+`ctx.shell` is a single-provider seam owned by the host composition
+(`SandboxPwshExecutor` on Windows): a second `shell` provider is rejected by
+cordis (`service "shell" has been registered`), and an agent preset cannot
+publish a root-realm provider. So a per-WSL-workspace shell cannot be *swapped*
+into `ctx.shell`.
+
+Instead `@crack/dsh-wsl/tool` is a model-facing **`wsl` tool** that is a normal
+consumer of the host `ctx.subprocess` service and runs the command inside the
+distro:
 
 ```text
-wsl.exe [-d <distro>] --cd <posix workdir> -- bash [-l] -c <command>
+wsl.exe [-d <distro>] --cd <linux-path> --exec bash -lc <script>
 ```
 
-- Windows workdirs are translated: `E:\x` → `/mnt/e/x`; `\\wsl.localhost\D\h\y`/`\\wsl$\D\h\y` → `/y`; POSIX and relative paths pass through.
-- `wsl.exe` does **not** forward the parent environment, so the model-friendly defaults and `DSH_*` snapshot are re-exported inside the Linux shell via an `export`/`unset` prefix (the `wslCommand` helper).
-- Deadlines, bounded output, spill files, and the background-process lifecycle all belong to the base class; only the argv changes.
-
-The base class is resolved at runtime against the **running** dsh install (same
-ESM module instance, no version drift, no runtime dependency to install).
+The `standard-wsl` agent preset (a user preset under
+`~/.dsh/.agent-presets/standard-wsl/`) reproduces the full `standard` agent set
+but disables the native `bash`/`pwsh` tools and mounts `@crack/dsh-wsl/tool`.
+Select `standard-wsl` for a WSL workspace's session and its commands run in the
+distro; Windows workspaces keep the native tools untouched.
 
 ## Requirements
 
 - Windows host with **WSL** installed and at least one distro (see `wsl -l`).
-- A working `@deepseek-ai/dsh-bash-local` in the dsh install (shipped with dsh).
+- The `@crack/dsh-wsl` package linked into the web profile.
 
 ## Install
-
-Link the package into the web profile once:
 
 ```powershell
 dsh plugin --profile web add "link:E:\Desktop\work\dsh-wsl"
@@ -37,43 +58,27 @@ dsh plugin --profile web add "link:E:\Desktop\work\dsh-wsl"
 
 ## Activate
 
-Merge the rows from `cordis.patch.yml` into the profile patch
+Merge the row from `cordis.patch.yml` into the profile patch
 `C:\Users\crack\.dsh\profiles\web\cordis.patch.yml`:
 
 ```yaml
-- id: pwsh-sandbox
-  disabled: true
-- id: tool-pwsh
-  disabled: true
-- id: tool-bash
-  disabled: false
 - insert:
     - id: wsl
       name: '@crack/dsh-wsl'
-      config:
-        distro: 'Ubuntu-22.04'
 ```
 
-This disables the Windows pwsh executor and the pwsh tool, enables the bash
-tool, and mounts `dsh-wsl` as the single `ctx.shell` provider. Set `distro` to
-your WSL distro (or omit it for the default). Editing the profile patch
-hot-reloads on save — no restart. Distro can also be forced per-env with
-`DSH_WSL_DISTRO`.
-
-> The plugin is a host injector of `ctx.shell`. Only activate it on a machine
-> with WSL present — otherwise the rewritten `wsl.exe` argv fails visibly on
-> every command and the bash tool becomes unusable.
+Then, for each WSL workspace you want to run Linux commands in, select the
+`standard-wsl` agent preset when creating/opening its session (the preset lives
+in `~/.dsh/.agent-presets/standard-wsl/`). The tool's default distro
+(`Ubuntu-22.04`) can be overridden in that preset's `tool-wsl` row `config`.
 
 ## Development
 
 ```powershell
-npm run build        # tsc → lib/
+npm run build        # tsc (host+client) → lib/, then tsdown client bundle
 npm run typecheck
-npm run check:local  # offline pure-function tests (no WSL needed)
-npm test             # full end-to-end over a real WSL distro (requires WSL)
 ```
 
-`test/run.mjs` composes a fresh cordis context with the real
-`dsh-subprocess-local` spawn service and `WslBashExecutor`, then asserts that
-commands really land inside WSL. `test/selfcheck.mjs` verifies module loading
-and the pure helpers (`toWslPath`, `wslCommand`) anywhere.
+The WSL tool source is `src/tool.ts`; it mirrors the stock `dsh-tool-bash`
+request/spec and `@deepseek-ai/dsh-timeout` deadline vocabulary, delegating
+process mechanics to `ctx.subprocess`.

@@ -44,6 +44,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
+/** An HTTP error whose message is safe to echo verbatim as the JSON `error` field. */
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = ''
@@ -136,6 +143,114 @@ interface DirEntry {
   hidden: boolean
 }
 
+// ---------------------------------------------------------------------------
+// API handler: a small route table with shared body validation and error
+// normalization, replacing the previous if-chain of repeated try/catch blocks.
+// ---------------------------------------------------------------------------
+
+/** Parse the JSON request body and reject with a 400 when a required field is blank. */
+async function requireBody(
+  req: IncomingMessage,
+  required: string[],
+): Promise<Record<string, unknown>> {
+  const body = await readJson(req)
+  const missing = required.filter((key) => String(body[key] ?? '').trim().length === 0)
+  if (missing.length > 0) {
+    throw new HttpError(400, `missing required field(s): ${missing.join(', ')}`)
+  }
+  return body
+}
+
+/** Run a route handler and normalize its rejection into an HTTP error JSON response. */
+async function wrap(
+  res: ServerResponse,
+  fn: () => Promise<void>,
+): Promise<void> {
+  try {
+    await fn()
+  } catch (error) {
+    if (res.headersSent) return
+    if (error instanceof HttpError) {
+      sendJson(res, error.status, { error: error.message })
+      return
+    }
+    const detail = error instanceof Error ? error.message : String(error)
+    const status = typeof error === 'object' && error !== null && 'code' in error && typeof (error as { code?: unknown }).code === 'number'
+      ? (error as { code: number }).code
+      : 500
+    sendJson(res, status >= 400 && status < 600 ? status : 500, { error: detail })
+  }
+}
+
+interface RouteContext {
+  workspaceRegistry: WorkspaceRegistry
+}
+
+type Handler = (c: RouteContext, req: IncomingMessage, res: ServerResponse) => Promise<void>
+
+const routes: Record<string, Handler> = {
+  'GET /distros': async (_c, _req, res) => {
+    const distros = await listDistros()
+    sendJson(res, 200, { distros })
+  },
+
+  'POST /home': async (_c, req, res) => {
+    const body = await requireBody(req, ['distro'])
+    const home = await distroHome(String(body.distro))
+    sendJson(res, 200, { home })
+  },
+
+  'POST /list': async (_c, req, res) => {
+    const body = await requireBody(req, ['distro', 'path'])
+    const distro = String(body.distro)
+    const path = String(body.path)
+    const out = await wslBash(distro, `ls -1ap -- ${shellQuote(path)}`)
+    const entries: DirEntry[] = []
+    for (const raw of out.split(/\r?\n/)) {
+      const line = raw.replace(/\r$/, '')
+      if (!line || line === '.' || line === '..') continue
+      const isDir = line.endsWith('/')
+      const name = isDir ? line.slice(0, -1) : line
+      const linuxPath = `${path.replace(/\/+$/, '')}/${name}`
+      entries.push({ name, linuxPath, isDir, hidden: name.startsWith('.') })
+    }
+    entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1))
+    sendJson(res, 200, { path, entries })
+  },
+
+  'POST /create': async (_c, req, res) => {
+    const body = await requireBody(req, ['distro', 'path', 'name'])
+    const name = String(body.name)
+    if (name === '.' || name === '..' || /[/\\]/.test(name)) {
+      throw new HttpError(400, 'name must be a single path segment')
+    }
+    const base = String(body.path)
+    await wslBash(String(body.distro), `mkdir -p -- ${shellQuote(base.replace(/\/+$/, '') + '/' + name)}`)
+    sendJson(res, 200, { ok: true })
+  },
+
+  'POST /register': async (c, req, res) => {
+    const body = await requireBody(req, ['distro', 'path'])
+    const distro = String(body.distro)
+    const path = String(body.path)
+    const title = typeof body.title === 'string' && body.title ? body.title : undefined
+    const unc = toUnc(distro, path)
+    const registry = c.workspaceRegistry
+    const existing = await registry.resolveByPath(unc)
+    const workspace = existing ?? await registry.create(unc, title)
+    sendJson(res, 200, {
+      workspace: {
+        workspaceId: workspace.id,
+        path: workspace.path,
+        title: workspace.title,
+        sessionIds: [...workspace.sessionIds],
+        createdAt: workspace.createdAt,
+        updatedAt: workspace.updatedAt,
+      },
+    })
+  },
+}
+
 async function handleApi(
   ctx: { workspaceRegistry: WorkspaceRegistry },
   req: IncomingMessage,
@@ -144,100 +259,13 @@ async function handleApi(
   const reqUrl = req.url ?? '/'
   const url = new URL(reqUrl, 'http://localhost')
   const route = url.pathname.slice(API_PREFIX.length).replace(/\/+$/, '') || '/'
-
-  if (req.method === 'GET' && route === '/distros') {
-    try {
-      const distros = await listDistros()
-      sendJson(res, 200, { distros })
-    } catch (error) {
-      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
-    }
+  const key = `${req.method ?? 'GET'} ${route}`
+  const handler = routes[key]
+  if (!handler) {
+    sendJson(res, 404, { error: `unknown route ${req.method ?? 'GET'} ${route}` })
     return
   }
-
-  if (req.method === 'POST' && route === '/home') {
-    const body = await readJson(req)
-    const distro = String(body.distro ?? '')
-    if (!distro) return sendJson(res, 400, { error: 'distro required' })
-    try {
-      const home = await distroHome(distro)
-      sendJson(res, 200, { home })
-    } catch (error) {
-      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
-    }
-    return
-  }
-
-  if (req.method === 'POST' && route === '/list') {
-    const body = await readJson(req)
-    const distro = String(body.distro ?? '')
-    const path = String(body.path ?? '')
-    if (!distro || !path) return sendJson(res, 400, { error: 'distro and path required' })
-    try {
-      const out = await wslBash(distro, `ls -1ap -- ${shellQuote(path)}`)
-      const entries: DirEntry[] = []
-      for (const raw of out.split(/\r?\n/)) {
-        const line = raw.replace(/\r$/, '')
-        if (!line || line === '.' || line === '..') continue
-        const isDir = line.endsWith('/')
-        const name = isDir ? line.slice(0, -1) : line
-        const linuxPath = `${path.replace(/\/+$/, '')}/${name}`
-        entries.push({ name, linuxPath, isDir, hidden: name.startsWith('.') })
-      }
-      entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1))
-      sendJson(res, 200, { path, entries })
-    } catch (error) {
-      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
-    }
-    return
-  }
-
-  if (req.method === 'POST' && route === '/create') {
-    const body = await readJson(req)
-    const distro = String(body.distro ?? '')
-    const path = String(body.path ?? '')
-    const name = String(body.name ?? '')
-    if (!distro || !path || !name) return sendJson(res, 400, { error: 'distro, path and name required' })
-    if (name === '.' || name === '..' || /[/\\]/.test(name)) {
-      return sendJson(res, 400, { error: 'name must be a single path segment' })
-    }
-    try {
-      await wslBash(distro, `mkdir -p -- ${shellQuote(path.replace(/\/+$/, '') + '/' + name)}`)
-      sendJson(res, 200, { ok: true })
-    } catch (error) {
-      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
-    }
-    return
-  }
-
-  if (req.method === 'POST' && route === '/register') {
-    const body = await readJson(req)
-    const distro = String(body.distro ?? '')
-    const path = String(body.path ?? '')
-    const title = typeof body.title === 'string' && body.title ? body.title : undefined
-    if (!distro || !path) return sendJson(res, 400, { error: 'distro and path required' })
-    try {
-      const unc = toUnc(distro, path)
-      const registry = ctx.workspaceRegistry
-      const existing = await registry.resolveByPath(unc)
-      const workspace = existing ?? await registry.create(unc, title)
-      sendJson(res, 200, {
-        workspace: {
-          workspaceId: workspace.id,
-          path: workspace.path,
-          title: workspace.title,
-          sessionIds: [...workspace.sessionIds],
-          createdAt: workspace.createdAt,
-          updatedAt: workspace.updatedAt,
-        },
-      })
-    } catch (error) {
-      sendJson(res, 500, { error: String(error instanceof Error ? error.message : error) })
-    }
-    return
-  }
-
-  sendJson(res, 404, { error: `unknown route ${route}` })
+  await wrap(res, () => handler(ctx, req, res))
 }
 
 /** Host apply: register the WSL workspace browser API. */

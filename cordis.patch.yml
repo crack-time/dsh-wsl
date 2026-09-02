@@ -1,10 +1,17 @@
-# @crack/dsh-wsl activation row.
+# @crack/dsh-wsl activation rows.
 #
-# Mount the WSL workspace plugin in a profile. The host half registers the
-# WSL workspace browser API and the client half seats a "＋ WSL 工作区" button
-# in the sidebar. Merge this row into the profile cordis.patch.yml (e.g.
-# C:\Users\crack\.dsh\profiles\web\cordis.patch.yml). The @crack/dsh-wsl
-# package must be installed (link:) so the row's `name` resolves.
+# 1) The WSL workspace plugin (this row) mounts in a PROFILE: the host half
+#    registers the WSL workspace browser API and the client half seats a
+#    "＋ WSL 工作区" button in the sidebar. Merge this row into the profile
+#    cordis.patch.yml (e.g. C:\Users\crack\.dsh\profiles\web\cordis.patch.yml).
+#    The @crack/dsh-wsl package must be installed (link:) so `name` resolves.
+#
+# 2) The WSL shell tool (`@crack/dsh-wsl/tool`) is activated via the
+#    `standard-wsl` agent preset, NOT a profile row. After registering a WSL
+#    workspace, select the `standard-wsl` preset for its session: that preset
+#    disables the native bash/pwsh tools and mounts the `wsl` tool so commands
+#    run inside the distro via wsl.exe — without replacing the host's single
+#    `ctx.shell` provider.
 - insert:
     - id: wsl
       name: '@crack/dsh-wsl'
