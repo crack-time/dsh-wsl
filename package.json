@@ -29,7 +29,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && tsdown",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test:util": "node test/wsl-util.test.mjs"
   },
   "license": "MIT",
   "files": [

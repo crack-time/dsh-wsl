@@ -23,7 +23,6 @@
  * `bash`/`pwsh`; only the argv (wsl.exe) and the lack of a Windows file-sandbox
  * wrap differ (Linux-side work cannot be confined by the Windows ACL sandbox).
  */
-import { isAbsolute, resolve } from 'node:path'
 import { connect } from 'node:net'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
@@ -31,51 +30,27 @@ import { HarnessError } from '@deepseek-ai/dsh-llm'
 import { parseExitStatus } from '@deepseek-ai/dsh-shell'
 import { clampTimeout, deadline, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { Context } from '@deepseek-ai/cordis'
+import {
+  buildScript,
+  distroOf,
+  toWslPath,
+  wslArgv,
+  resolveWorkdir,
+  shellQuote,
+  DEFAULT_DISTRO,
+  DEFAULT_TIMEOUT_MS,
+  MAX_TIMEOUT_MS,
+} from './wsl-util.ts'
 
 export const name = 'tool-wsl'
 export const inject = ['tools', 'systemPrompt', 'subprocess', 'shellEnv', 'jobs']
 
 // ---------------------------------------------------------------------------
-// WSL / env helpers
+// WSL / env helpers (pure helpers live in wsl-util.ts, imported above)
 // ---------------------------------------------------------------------------
-const DEFAULT_DISTRO = 'Ubuntu-22.04'
 const TIMEOUT_CODE = 'TOOL_WSL_TIMEOUT'
-const DEFAULT_TIMEOUT_MS = 120_000
-const MAX_TIMEOUT_MS = 600_000
 const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 const DEFAULT_GRACE_MS = 3000
-const WSL_UNC_RE = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)\\(.*)$/i
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`
-}
-
-/** True when a workdir points into a WSL distro via its UNC share. */
-function isWslUnc(workdir: string): boolean {
-  return WSL_UNC_RE.test(workdir.replaceAll('/', '\\'))
-}
-
-/** Translate a workdir into the in-distro path (UNC share or bare Linux path). */
-function toWslPath(workdir: string): string {
-  if (!workdir) return '/'
-  const win = workdir.replaceAll('/', '\\')
-  const m = WSL_UNC_RE.exec(win)
-  if (!m) return workdir
-  const inside = m[2] ?? ''
-  return `/${inside.replaceAll('\\', '/')}`
-}
-
-/** The distro name from a WSL UNC workdir, else the configured default. */
-function distroOf(workdir: string | undefined, configuredDistro: string): string {
-  const win = String(workdir ?? '').replaceAll('/', '\\')
-  const m = WSL_UNC_RE.exec(win)
-  if (m && m[1]) return m[1]
-  return (configuredDistro && configuredDistro.trim()) || DEFAULT_DISTRO
-}
-
-function wslArgv(distro: string, linuxPath: string, script: string, command: string): string[] {
-  return ['wsl.exe', '-d', distro, '--cd', linuxPath, '--exec', 'bash', '-lc', `${script}\n${command}`]
-}
 
 // ---------------------------------------------------------------------------
 // Resident-execution daemon client (daemon/exec-server.js)
@@ -290,15 +265,6 @@ function presentResult(args: { run_in_background?: boolean }, result: { content:
 }
 
 /** Build a `bash` prefix that re-exports model-facing env inside the distro. */
-function buildScript(modelFriendlyEnv: Record<string, string>): string {
-  const lines: string[] = []
-  for (const [key, value] of Object.entries(modelFriendlyEnv)) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
-    lines.push(`export ${key}=${shellQuote(value)}`)
-  }
-  return lines.join('\n')
-}
-
 // Bridge-mode env bootstrap. `wsl.exe --exec bash -lc` is non-interactive, so
 // it never reads ~/.bashrc and brew/conda/cuda/lammps are off PATH — uv/conda
 // report "not found" for one-shot commands. Source the SAME dshwsl-env.bash the
@@ -408,9 +374,7 @@ export function apply(_ctx: Context, config: {
     }): Promise<unknown> {
       validateArgs(args)
       const sessionCwd = exec.agent?.session.header.cwd
-      const workdir = args.workdir !== void 0
-        ? (isAbsolute(args.workdir) ? args.workdir : resolve(sessionCwd ?? '', args.workdir))
-        : sessionCwd
+      const workdir = resolveWorkdir(args.workdir, sessionCwd)
       const distro = distroOf(workdir, configuredDistro)
       const linuxPath = toWslPath(workdir ?? '')
       const dshEnv = ctx.shellEnv.collect(exec) as Record<string, string>
