@@ -50,22 +50,22 @@ export function apply(ctx: ClientContext): void {
   function ensureButton(): void {
     if (document.querySelector('[data-dshwsl-add-btn]')) return
 
-    // Find the native sidebar "Add workspace" icon button and seat ours after it.
+    // Seat ours right after the native sidebar "Add workspace" button. Clone
+    // the native element so the icon, size, and styles match the native skin
+    // exactly (the clone carries the same classes/attribute/SVG, only the
+    // aria-label + tooltip + click target change).
     const labels = NATIVE_ADD_LABELS
     for (const btn of document.querySelectorAll<HTMLButtonElement>('button[aria-label]')) {
       const label = (btn.getAttribute('aria-label') || '').trim()
       if (labels.includes(label)) {
-        const b = document.createElement('button')
-        b.type = 'button'
+        const b = btn.cloneNode(true) as HTMLButtonElement
+        // Cloning must not duplicate DOM ids (the native tree may use them).
+        if (b.id) b.id = ''
+        b.querySelectorAll<HTMLElement>('[id]').forEach((el) => el.removeAttribute('id'))
+        b.removeAttribute('aria-pressed')
         b.dataset.dshwslAddBtn = ''
         b.setAttribute('aria-label', 'WSL 工作区')
         b.title = 'WSL 工作区'
-        // Plus-in-folder icon (native minimal style).
-        b.innerHTML =
-          '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
-          '<path fill="currentColor" d="M5.4 2.1 4.7 2.5 5.4 2.1Zm7.6 9.8h-6v1h6v-1ZM6.5 1.9v3.6h1V1.9h-1Zm3.4 3.6V1.9h-1v3.6h1Zm-4.6 3.7h3v-1h-3v1Z" transform="translate(1.5 1)" opacity="0.9"/>' +
-          '<path fill="currentColor" d="M2.5 1.5h4.2v1H3.5v11h9v-4.2h1V13a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2.5 13V3a1.5 1.5 0 0 1 1.5-1.5Zm7 8V6.3h3v1h-2v2.2h-1Z" transform="translate(1.5 1)"/>' +
-          '</svg>'
         b.addEventListener('click', () => {
           currentCleanup?.()
           currentCleanup = mountBrowser(() => {

@@ -90,15 +90,25 @@ async function wslBash(distro: string, script: string): Promise<string> {
   return stdout
 }
 
-/** Enumerate installed WSL distros (order preserved; defaults first). */
+/** Enumerate installed WSL distros (order preserved; defaults first).
+ *  wsl.exe writes the listing as UTF-16LE, so read the buffer and sniff the
+ *  encoding (BOM or embedded NULs) instead of assuming UTF-8. */
 async function listDistros(): Promise<string[]> {
   const { stdout } = await execFile('wsl.exe', ['-l', '-q'], {
-    encoding: 'utf8',
+    encoding: 'buffer',
     windowsHide: true,
     maxBuffer: 1024 * 1024,
     timeout: 15_000,
   })
-  return stdout
+  const buf = stdout as Buffer
+  let text: string
+  if (buf.length >= 2 && (buf.readUInt16LE(0) === 0xfeff || buf.indexOf(0) !== -1)) {
+    // UTF-16LE (possibly with a BOM) → decode as utf16le and drop the BOM.
+    text = buf.toString('utf16le').replace(/^\uFEFF/, '')
+  } else {
+    text = buf.toString('utf8')
+  }
+  return text
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && line !== '*')
