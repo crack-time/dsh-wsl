@@ -46,9 +46,14 @@
 'use strict';
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+const { existsSync } = require('node:fs');
+const { join } = require('node:path');
 
 const PORT = Number(process.env.DSHWSL_EXEC_PORT || 37778);
 const BASH = process.env.DSHWSL_BASH || '/bin/bash';
+// BASH_ENV bootstrap that reproduces ~/.bashrc's exported env for the
+// daemon's non-interactive persistent bash (see daemon/dshwsl-env.bash).
+const ENV_BASH_FILE = process.env.HOME ? join(process.env.HOME, '.dshwsl', 'dshwsl-env.bash') : null;
 const DEFAULT_TIMEOUT_MS = 120000;
 const MAX_OUTPUT_CHARS = 64 * 1024;
 
@@ -75,8 +80,16 @@ class PersistentShell {
 
   _spawn() {
     // stdio[3] is the exit-code sentinel pipe.
+    // For non-interactive shells bash honors BASH_ENV: point it at an env
+    // bootstrap that reproduces the user's ~/.bashrc environment (linuxbrew,
+    // conda, cuda/lammps PATH) without the interactive guard. Only set when
+    // the file exists so a missing bootstrap is a silent no-op.
+    const childEnv = ENV_BASH_FILE && existsSync(ENV_BASH_FILE)
+      ? { ...process.env, BASH_ENV: ENV_BASH_FILE }
+      : undefined;
     this.proc = spawn(BASH, ['--noprofile', '--norc', '--noediting'], {
       stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+      ...(childEnv ? { env: childEnv } : {}),
     });
     this.closed = false;
     this._initialized = false;
