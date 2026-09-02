@@ -34,7 +34,7 @@ function command(req) {
         else if (f.done) { clearTimeout(t); socket.end(); out.done = f; resolve(out); }
       }
     });
-    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs }) + '\n');
+    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, session: req.session, initWorkdir: req.initWorkdir, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs }) + '\n');
     const wait = req.timeoutMs && req.timeoutMs > 0 ? req.timeoutMs : 30000;
     const t = setTimeout(() => { socket.destroy(); reject(new Error('reply timeout')); }, wait + 8000);
   });
@@ -87,5 +87,24 @@ function show(r) {
   console.log((r.done.exitCode === 0 || r.done.error === void 0) && r.stdout.length > 0
     ? '  ✔ large output settled, no hang'
     : '  ✘ large output did not settle');
+
+  section('6. cd persists across calls within a session (the user test)');
+  r = await command({ id: 8, cmd: 'cd /tmp && export M=hi', session: 'ws-A' });
+  show(r);
+  r = await command({ id: 9, cmd: 'echo "M=$M pwd=$(pwd)"', session: 'ws-A' });
+  show(r);
+  console.log(r.stdout.includes('M=hi') && r.stdout.includes('/tmp')
+    ? '  ✔ cd+export persist across calls (same session)'
+    : '  ✘ cd did not persist');
+
+  section('7. per-session isolation (session B starts at its own seed)');
+  r = await command({ id: 10, cmd: 'pwd', session: 'ws-B', initWorkdir: '/opt' });
+  show(r);
+  console.log(r.stdout.trim() === '/opt' ? '  ✔ session B seeded to /opt, not session A cwd' : '  ✘ session bleed');
+
+  section('8. explicit workdir still overrides');
+  r = await command({ id: 11, cmd: 'pwd', session: 'ws-A', workdir: '/etc' });
+  show(r);
+  console.log(r.stdout.trim() === '/etc' ? '  ✔ explicit workdir overrides persistent cwd' : '  ✘ explicit workdir ignored');
 
 })().catch((e) => { console.error('FATAL ' + e.message); process.exit(1); });

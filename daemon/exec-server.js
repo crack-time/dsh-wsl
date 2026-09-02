@@ -13,7 +13,12 @@
  * connects to `127.0.0.1:<port>` without any UNC path or per-call wsl.exe.
  *
  * Protocol (client → server), one line, all fields optional except id/cmd:
- *   {"id":1,"cmd":"ls -l","workdir":"/home/crack","timeoutMs":30000,"env":{...}}
+ *   {"id":1,"cmd":"ls -l","session":"<key?>","initWorkdir":"/home/crack/work","workdir":"<?explicit>","timeoutMs":30000,"env":{...}}
+ *
+ * cwd semantics: a fresh shell (per `session`) is seeded once from
+ * `initWorkdir`; afterwards it keeps its persistent cwd and only `cd`s to an
+ * explicitly-present `workdir`. So `cd /tmp` in one command survives into the
+ * next for the same session — that is the point of a resident shell.
  *
  * Server → client, streamed:
  *   {"id":1,"channel":"stdout","text":"..."}
@@ -74,6 +79,7 @@ class PersistentShell {
       stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
     });
     this.closed = false;
+    this._initialized = false;
     this._exitWait = null;
     this.proc.on('error', () => { this.closed = true; });
     this.proc.on('exit', (code, signal) => {
@@ -109,7 +115,21 @@ class PersistentShell {
     return run;
   }
 
-  _exec({ cmd, workdir, env, timeoutMs }) {
+  _exec({ cmd, workdir, initWorkdir, env, timeoutMs }) {
+    // cwd semantics for a persistent shell:
+    //  - First request on a fresh shell: seed cwd from initWorkdir (the
+    //    workspace root) so the session starts anchored, then mark initialized.
+    //  - Later requests: cd only when the caller explicitly passed a `workdir`
+    //    override; otherwise keep the persistent cwd (`cd` in a prior command
+    //    survives). This is what makes `cd /tmp` persist across calls.
+    let cdLine;
+    if (!this._initialized) {
+      this._initialized = true;
+      const seed = initWorkdir || workdir;
+      if (seed) cdLine = `cd ${sq(seed)} 2>/dev/null`;
+    } else if (workdir) {
+      cdLine = `cd ${sq(workdir)} 2>/dev/null`;
+    }
     const script = [
       env && Object.keys(env).length
         ? Object.entries(env)
@@ -117,7 +137,7 @@ class PersistentShell {
             .map(([k, v]) => `export ${k}=${sq(v)}`)
             .join('\n')
         : '',
-      workdir ? `cd ${sq(workdir)} 2>/dev/null` : '',
+      cdLine,
       cmd,
       'echo $? >&3',
     ].filter(Boolean).join('\n');
@@ -167,14 +187,20 @@ class PersistentShell {
   }
 }
 
-// ONE shell for the daemon's whole lifetime (NOT per-connection).
-let sharedShell = null;
-function getShell() {
-  if (!sharedShell || sharedShell.closed) {
-    if (sharedShell) { try { sharedShell.dispose(); } catch {} }
-    sharedShell = new PersistentShell();
+// Per-session shells, keyed by an optional `session` string in each request.
+// Absent session → the 'default' shell. Each shell keeps its own persistent
+// bash, so cwd/across sessions do not bleed into each other.
+const SHELLS = new Map();
+const DEFAULT_SESSION = 'default';
+function getShell(session) {
+  const key = typeof session === 'string' && session.length ? session : DEFAULT_SESSION;
+  let shell = SHELLS.get(key);
+  if (!shell || shell.closed) {
+    if (shell) { try { shell.dispose(); } catch {} }
+    shell = new PersistentShell();
+    SHELLS.set(key, shell);
   }
-  return sharedShell;
+  return shell;
 }
 
 const server = net.createServer((socket) => {
@@ -189,7 +215,7 @@ const server = net.createServer((socket) => {
     if (busy || queue.length === 0) return;
     const req = queue.shift();
     busy = true;
-    getShell().runRequest(req).then((res) => {
+    getShell(req.session).runRequest(req).then((res) => {
       if (res.ok) {
         if (res.stdout) send({ id: req.id, channel: 'stdout', text: res.stdout });
         if (res.stderr) send({ id: req.id, channel: 'stderr', text: res.stderr });
@@ -218,6 +244,8 @@ const server = net.createServer((socket) => {
       queue.push({
         id: obj.id ?? null,
         cmd: obj.cmd,
+        session: typeof obj.session === 'string' && obj.session ? obj.session : undefined,
+        initWorkdir: typeof obj.initWorkdir === 'string' && obj.initWorkdir ? obj.initWorkdir : undefined,
         workdir: typeof obj.workdir === 'string' && obj.workdir ? obj.workdir : undefined,
         env: obj.env && typeof obj.env === 'object' ? obj.env : undefined,
         timeoutMs: Number.isFinite(obj.timeoutMs) && obj.timeoutMs > 0 ? obj.timeoutMs : DEFAULT_TIMEOUT_MS,
@@ -236,5 +264,5 @@ server.listen(PORT, '127.0.0.1', () => {
   process.stdout.write(`[exec-server] listening on 127.0.0.1:${PORT} (pid ${process.pid})\n`);
 });
 
-process.on('SIGTERM', () => { if (sharedShell) sharedShell.dispose(); process.exit(0); });
-process.on('SIGINT', () => { if (sharedShell) sharedShell.dispose(); process.exit(0); });
+process.on('SIGTERM', () => { for (const s of SHELLS.values()) s.dispose(); process.exit(0); });
+process.on('SIGINT', () => { for (const s of SHELLS.values()) s.dispose(); process.exit(0); });

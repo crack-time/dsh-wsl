@@ -108,6 +108,8 @@ interface DaemonResult {
  */
 function runViaDaemon(host: string, port: number, req: {
   cmd: string
+  session?: string
+  initWorkdir?: string
   workdir?: string
   env?: Record<string, string>
   timeoutMs: number
@@ -123,7 +125,15 @@ function runViaDaemon(host: string, port: number, req: {
     const idle = setTimeout(() => fail(`daemon unresponsive after ${req.timeoutMs}ms`), req.timeoutMs + 8000)
     socket.on('error', (e: Error) => settle(() => { fail(`daemon connect failed: ${e.message}`) }))
     socket.on('connect', () => {
-      socket.write(JSON.stringify({ id: 1, cmd: req.cmd, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs }) + '\n')
+      socket.write(JSON.stringify({
+        id: 1,
+        cmd: req.cmd,
+        session: req.session,
+        initWorkdir: req.initWorkdir,
+        workdir: req.workdir,
+        env: req.env,
+        timeoutMs: req.timeoutMs,
+      }) + '\n')
     })
     socket.on('data', (chunk: Buffer | string) => {
       buf += chunk.toString('utf8')
@@ -341,9 +351,14 @@ export function apply(_ctx: Context, config: {
           for (const [k, v] of Object.entries(args.env)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
         }
         try {
+          // Per-workspace persistent shell: key by the workspace's Linux path,
+          // seed it once to that path, and only override cwd when the model
+          // explicitly passed a workdir — so `cd` inside a prior command persists.
           const r = await runViaDaemon(daemonHost, daemonPort, {
             cmd: args.command,
-            workdir: linuxPath || '/',
+            session: linuxPath || '/',
+            initWorkdir: linuxPath || '/',
+            workdir: args.workdir !== void 0 ? linuxPath : undefined,
             env: dshEnv,
             timeoutMs,
           })
