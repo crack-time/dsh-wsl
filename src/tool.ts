@@ -197,9 +197,9 @@ export function apply(_ctx: Context, config: { distro?: string; enableRunInBackg
     output: {
       schema: {
         oneOf: [
-          { type: 'object', additionalProperties: false, properties: { kind: { const: 'background' }, jobId: { type: 'string' } } },
+          { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', required: true, const: 'background' }, jobId: { type: 'string', required: true } } },
           { type: 'object', additionalProperties: false, properties: {
-            kind: { const: 'foreground' },
+            kind: { type: 'string', required: true, const: 'foreground' },
             exitCode: { required: true, oneOf: [{ type: 'integer' }, { type: 'null' }] },
             signal: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
             timedOut: { type: 'boolean' },
