@@ -215,8 +215,89 @@ async function deployDaemonPayload(ctx: { subprocess: { spawn(spec: unknown): an
   }
 }
 
-// Bash one-liner, spawn via `wsl.exe -d <distro> -- bash -lc <this>`.
-// Resolves a node by preference, cd's into ~/.dshwsl, and starts the
+// ── daemon background ops (op: bg / bg-status / bg-read / bg-cancel) ───────
+/** One-shot daemon op: connect, send one request, return the matching reply. */
+function daemonOp(host: string, port: number, token: string | undefined, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host, port })
+    const reqId = Math.floor(Math.random() * 1e9)
+    let buf = ''
+    const fail = (msg: string) => { socket.destroy(); reject(new Error(msg)) }
+    const idle = setTimeout(() => fail('daemon op timed out'), 15000)
+    socket.on('error', () => fail('daemon op connect failed'))
+    socket.on('connect', () => {
+      socket.write(JSON.stringify({ ...payload, id: reqId, ...(token ? { token } : {}) }) + '\n')
+    })
+    socket.on('data', (chunk: Buffer | string) => {
+      buf += chunk.toString('utf8')
+      let i
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim()
+        buf = buf.slice(i + 1)
+        if (!line) continue
+        let f: Record<string, unknown>
+        try { f = JSON.parse(line) } catch { continue }
+        if (f.id !== reqId) continue
+        clearTimeout(idle)
+        socket.end()
+        resolve(f)
+      }
+    })
+  })
+}
+
+/**
+ * Start a detached daemon background job. Returns the daemon's jobId, which the
+ * caller folds into a `ctx.jobs` handle whose `done`/`readOutput`/`cancel` poll
+ * the daemon over fresh connections (bg-status / bg-read / bg-cancel).
+ */
+async function startDaemonBackground(host: string, port: number, token: string | undefined, req: {
+  cmd: string
+  session: string
+  initWorkdir: string
+  workdir?: string
+  env?: Record<string, string>
+}): Promise<string> {
+  const r = await daemonOp(host, port, token, {
+    op: 'bg',
+    cmd: req.cmd,
+    session: req.session,
+    initWorkdir: req.initWorkdir,
+    workdir: req.workdir,
+    env: req.env,
+  })
+  if (typeof r.jobId !== 'string' || !r.jobId) throw new Error(`wsl daemon bg start failed: ${String(r.error ?? '')}`)
+  return r.jobId
+}
+
+function makeDaemonBackgroundHandle(host: string, port: number, token: string | undefined, jobId: string) {
+  const waitDone = (): Promise<{ status: string; detail: string }> => new Promise((resolve) => {
+    const poll = async () => {
+      const st = await daemonOp(host, port, token, { op: 'bg-status', jobId }).catch(() => ({ done: true, exitCode: null }))
+      if (st.done) {
+        resolve({
+          status: 'completed',
+          detail: `exit code: ${st.exitCode == null ? 0 : String(st.exitCode)}`,
+        })
+      } else {
+        setTimeout(poll, 600)
+      }
+    }
+    void poll()
+  })
+  let readOffset = 0
+  return {
+    cancel: () => void daemonOp(host, port, token, { op: 'bg-cancel', jobId }).catch(() => {}),
+    done: waitDone(),
+    readOutput: async () => {
+      const r = await daemonOp(host, port, token, { op: 'bg-read', jobId }).catch(() => ({ text: '' }))
+      const text = String(r.text ?? '')
+      const delta = text.slice(readOffset)
+      readOffset = text.length
+      return { delta, lossy: false }
+    },
+  }
+}
 // exec-server detached (setsid nohup + </dev/null + disown) with an optional
 // shared secret. The trailing `sleep 2` keeps the parent bash alive long
 // enough for setsid to fully detach so the process survives the wsl.exe client
@@ -535,6 +616,26 @@ export function apply(_ctx: Context, config: {
           const error = new HarnessError('tool call aborted', TOOL_ABORTED)
           error.name = 'AbortError'
           throw error
+        }
+        // Daemon mode: run the background job against the resident exec-server
+        // (detached bash) so persistence semantics apply here too; else bridge.
+        if (daemonEnabled) {
+          const dJobId = await startDaemonBackground(daemonHost, daemonPort, daemonToken, {
+            cmd: args.command,
+            session: linuxPath || '/',
+            initWorkdir: linuxPath || '/',
+            workdir: args.workdir !== void 0 ? linuxPath : undefined,
+            env: dshEnv,
+          })
+          return {
+            kind: 'background',
+            jobId: jobs.start({
+              kind: 'wsl',
+              label: args.command,
+              ...(exec.agent ? { owner: exec.agent } : {}),
+              run: () => makeDaemonBackgroundHandle(daemonHost, daemonPort, daemonToken, dJobId),
+            }),
+          }
         }
         return {
           kind: 'background',

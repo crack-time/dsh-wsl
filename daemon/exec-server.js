@@ -46,7 +46,7 @@
 'use strict';
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { existsSync } = require('node:fs');
+const { existsSync, mkdirSync, createWriteStream, readFileSync, writeFileSync, statSync, openSync, closeSync } = require('node:fs');
 const { join } = require('node:path');
 
 const PORT = Number(process.env.DSHWSL_EXEC_PORT || 37778);
@@ -222,6 +222,83 @@ function getShell(session) {
   return shell;
 }
 
+// ── background jobs (op: bg / bg-status / bg-read / bg-cancel) ────────────
+// A background job is a DETACHED bash that keeps running after the daemon
+// replies. Its stdout/stderr go to ~/.dshwsl/jobs/<id>.out and its exit code to
+// <id>.code, so the tool can poll status + read output at its own pace.
+const JOBS_DIR = process.env.HOME ? join(process.env.HOME, '.dshwsl', 'jobs') : join('.', 'jobs');
+let jobSeq = 0;
+const JOBS = new Map(); // jobId -> {proc, outFile, codeFile}
+
+function envExportLines(env) {
+  if (!env) return '';
+  return Object.entries(env)
+    .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
+    .map(([k, v]) => `export ${k}=${sq(v)}`)
+    .join('\n');
+}
+
+function startBgJob(obj) {
+  try { mkdirSync(JOBS_DIR, { recursive: true }); } catch {}
+  const key = typeof obj.session === 'string' && obj.session ? obj.session : DEFAULT_SESSION;
+  const id = `${key}-${++jobSeq}-${Date.now().toString(36)}`;
+  const outFile = join(JOBS_DIR, `${id}.out`);
+  const codeFile = join(JOBS_DIR, `${id}.code`);
+  const script = [
+    envExportLines(obj.env),
+    obj.initWorkdir ? `cd ${sq(obj.initWorkdir)} 2>/dev/null` : '',
+    obj.workdir ? `cd ${sq(obj.workdir)} 2>/dev/null` : '',
+    obj.cmd,
+  ].filter(Boolean).join('\n');
+  try {
+    // Open the out file for append up front and hand its fd to `spawn`'s stdio
+    // (a bare WriteStream with fd:null is rejected by spawn). stdout+stderr
+    // share the same fd so both interleave into <id>.out like a merged log.
+    const fd = openSync(outFile, 'a');
+    const proc = spawn(BASH, ['-lc', script], {
+      detached: true,
+      env: { ...process.env, DSHPARENT: process.pid },
+      stdio: ['ignore', fd, fd],
+    });
+    proc.unref();
+    proc.on('exit', (code) => {
+      try { writeFileSync(codeFile, String(code ?? 1), 'utf8'); } catch {}
+      try { closeSync(fd); } catch {}
+    });
+    JOBS.set(id, { proc, outFile, codeFile });
+    return id;
+  } catch (e) {
+    try { writeFileSync(join(JOBS_DIR, '..', 'bg-error.log'), `${new Date().toISOString()} ${(e && e.stack) || e}\n`, { flag: 'a' }); } catch {}
+    return null;
+  }
+}
+
+function bgStatus(jobId) {
+  const j = JOBS.get(jobId);
+  if (!j) return { done: true, exitCode: null, missing: true };
+  const alive = j.proc.exitCode === null;
+  if (!alive) {
+    let code = j.proc.exitCode;
+    if (code === null) { try { code = Number(readFileSync(j.codeFile, 'utf8').trim()) || null; } catch {} }
+    JOBS.delete(jobId);
+    return { done: true, exitCode: code ?? null };
+  }
+  return { done: false, exitCode: null };
+}
+
+function bgCancel(jobId) {
+  const j = JOBS.get(jobId);
+  if (!j) return;
+  try { process.kill(-j.proc.pid, 'SIGKILL'); } catch {}
+  try { process.kill(j.proc.pid, 'SIGKILL'); } catch {}
+}
+
+function bgRead(jobId) {
+  const j = JOBS.get(jobId);
+  if (!j) return '';
+  try { return readFileSync(j.outFile, 'utf8'); } catch { return ''; }
+}
+
 const server = net.createServer((socket) => {
   let buffer = '';
   let busy = false;
@@ -258,6 +335,25 @@ const server = net.createServer((socket) => {
       try { obj = JSON.parse(line); } catch { send({ id: null, error: 'bad json' }); continue; }
       if (TOKEN && obj.token !== TOKEN) {
         send({ id: obj.id ?? null, done: true, exitCode: null, signal: null, error: 'unauthorized' });
+        continue;
+      }
+      if (obj.op === 'bg') {
+        const jobId = startBgJob(obj);
+        send(jobId ? { id: obj.id ?? null, kind: 'background', jobId } : { id: obj.id ?? null, done: true, error: 'bg start failed' });
+        continue;
+      }
+      if (obj.op === 'bg-status') {
+        const s = bgStatus(typeof obj.jobId === 'string' ? obj.jobId : '');
+        send({ id: obj.id ?? null, done: s.done, exitCode: s.exitCode });
+        continue;
+      }
+      if (obj.op === 'bg-read') {
+        send({ id: obj.id ?? null, channel: 'stdout', text: bgRead(typeof obj.jobId === 'string' ? obj.jobId : '') });
+        continue;
+      }
+      if (obj.op === 'bg-cancel') {
+        bgCancel(typeof obj.jobId === 'string' ? obj.jobId : '');
+        send({ id: obj.id ?? null, done: true, exitCode: null });
         continue;
       }
       if (typeof obj.cmd !== 'string' || obj.cmd.length === 0) {
