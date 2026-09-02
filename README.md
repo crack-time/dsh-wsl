@@ -61,7 +61,7 @@ The `daemon/` directory ships the P0 implementation:
 | file | role |
 |---|---|
 | `daemon/exec-server.js` | resident bash execution machine (zero-dependency Node, runs on `~/.zcode/server/node` v22 inside WSL) |
-| `daemon/launch.sh` | detach + revive helper (`setsid nohup`, writes `daemon.pid`) |
+| `daemon/launch.sh` | detach + revive helper; resolves Node by preference (`node` on PATH → linuxbrew `~/.linuxbrew/bin/node` → bundled `~/.zcode/server/node` fallback), `setsid nohup`, writes `daemon.pid` |
 | `daemon/client.cjs` | Windows-side test client (`node daemon/client.cjs`) |
 
 The daemon listens on `127.0.0.1:37778`; Windows reaches it through WSL2's
