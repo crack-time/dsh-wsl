@@ -45,6 +45,49 @@ but disables the native `bash`/`pwsh` tools and mounts `@crack/dsh-wsl/tool`.
 Select `standard-wsl` for a WSL workspace's session and its commands run in the
 distro; Windows workspaces keep the native tools untouched.
 
+#### Runtime: bridge vs daemon (resident execution)
+
+The tool has two ways to run a command in the distro:
+
+- **`runtime: bridge`** (default): spawn `wsl.exe` per call — a fresh bash each
+  time, no state between calls.
+- **`runtime: daemon`**: send the command to a **resident WSL exec-server**
+  (`daemon/exec-server.js`) holding a single persistent bash. `cd` / `export`
+  survive across calls (state persists), and each call avoids the per-command
+  WSL kernel handshake.
+
+The `daemon/` directory ships the P0 implementation:
+
+| file | role |
+|---|---|
+| `daemon/exec-server.js` | resident bash execution machine (zero-dependency Node, runs on `~/.zcode/server/node` v22 inside WSL) |
+| `daemon/launch.sh` | detach + revive helper (`setsid nohup`, writes `daemon.pid`) |
+| `daemon/client.cjs` | Windows-side test client (`node daemon/client.cjs`) |
+
+The daemon listens on `127.0.0.1:37778`; Windows reaches it through WSL2's
+automatic localhost forwarding (the model + UI loop stay in Windows). To use
+it:
+
+```bash
+# inside WSL: start the resident exec-server once
+bash ~/.dshwsl/launch.sh          # or: cd ~/.dshwsl && setsid nohup ~/.zcode/server/node exec-server.js &
+```
+
+then point the preset's `tool-wsl` row at it:
+
+```yaml
+- id: tool-wsl
+  name: '@crack/dsh-wsl/tool'
+  config:
+    distro: 'Ubuntu-22.04'
+    runtime: 'daemon'
+    daemon: { host: '127.0.0.1', port: 37778 }
+```
+
+Background (`run_in_background`) requests still bridge via `wsl.exe`. In
+`daemon` mode, a hard timeout terminates and respawns the persistent shell
+(state lost only on timeout).
+
 ## Requirements
 
 - Windows host with **WSL** installed and at least one distro (see `wsl -l`).

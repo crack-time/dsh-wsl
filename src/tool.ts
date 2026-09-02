@@ -24,6 +24,7 @@
  * wrap differ (Linux-side work cannot be confined by the Windows ACL sandbox).
  */
 import { isAbsolute, resolve } from 'node:path'
+import { connect } from 'node:net'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
@@ -74,6 +75,85 @@ function distroOf(workdir: string | undefined, configuredDistro: string): string
 
 function wslArgv(distro: string, linuxPath: string, script: string, command: string): string[] {
   return ['wsl.exe', '-d', distro, '--cd', linuxPath, '--exec', 'bash', '-lc', `${script}\n${command}`]
+}
+
+// ---------------------------------------------------------------------------
+// Resident-execution daemon client (daemon/exec-server.js)
+// ---------------------------------------------------------------------------
+interface DaemonFrame {
+  id?: number
+  channel?: 'stdout' | 'stderr'
+  text?: string
+  done?: boolean
+  exitCode?: number | null
+  signal?: string | null
+  error?: string
+}
+
+interface DaemonResult {
+  exitCode: number | null
+  signal: string | null
+  stdout: string
+  stderr: string
+  timedOut: boolean
+  error?: string
+}
+
+/**
+ * Run a single foreground command against the resident WSL exec-server
+ * (daemon/exec-server.js) over a localhost TCP socket. Opens a fresh
+ * connection per call; the daemon's own persistent bash holds `cd`/`export`
+ * across calls. The daemon enforces the timeout and replies done with the
+ * exit code; the local timer is only a safety net for total unavailability.
+ */
+function runViaDaemon(host: string, port: number, req: {
+  cmd: string
+  workdir?: string
+  env?: Record<string, string>
+  timeoutMs: number
+}): Promise<DaemonResult> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host, port })
+    let buf = ''
+    let stdout = ''
+    let stderr = ''
+    let done = false
+    const settle = (fn: () => void) => { if (!done) { done = true; fn() } }
+    const fail = (msg: string) => settle(() => { socket.destroy(); reject(new Error(msg)) })
+    const idle = setTimeout(() => fail(`daemon unresponsive after ${req.timeoutMs}ms`), req.timeoutMs + 8000)
+    socket.on('error', (e: Error) => settle(() => { fail(`daemon connect failed: ${e.message}`) }))
+    socket.on('connect', () => {
+      socket.write(JSON.stringify({ id: 1, cmd: req.cmd, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs }) + '\n')
+    })
+    socket.on('data', (chunk: Buffer | string) => {
+      buf += chunk.toString('utf8')
+      let i
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim()
+        buf = buf.slice(i + 1)
+        if (!line) continue
+        let f: DaemonFrame
+        try { f = JSON.parse(line) } catch { continue }
+        if (f.id !== 1) continue
+        if (f.channel === 'stdout') stdout += f.text ?? ''
+        else if (f.channel === 'stderr') stderr += f.text ?? ''
+        else if (f.done) {
+          clearTimeout(idle)
+          settle(() => {
+            socket.end()
+            resolve({
+              exitCode: f.exitCode ?? null,
+              signal: f.signal ?? null,
+              stdout,
+              stderr,
+              timedOut: f.error === 'timed out' || /timed out/.test(f.error ?? ''),
+              error: f.error,
+            })
+          })
+        }
+      }
+    })
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +234,14 @@ function buildScript(modelFriendlyEnv: Record<string, string>): string {
 // ---------------------------------------------------------------------------
 // The tool plugin
 // ---------------------------------------------------------------------------
-export function apply(_ctx: Context, config: { distro?: string; enableRunInBackground?: boolean } = {}): void {
+export function apply(_ctx: Context, config: {
+  distro?: string
+  enableRunInBackground?: boolean
+  /** 'bridge' (default) spawns wsl.exe per call; 'daemon' sends commands to a resident WSL exec-server. */
+  runtime?: 'bridge' | 'daemon'
+  /** Connection target when runtime === 'daemon'. host/port default to the localhost-forwarded WSL2 target. */
+  daemon?: { host?: string; port?: number }
+} = {}): void {
   const ctx = _ctx as unknown as {
     systemPrompt: { section(o: unknown): void; getSectionOrder(n: string): number }
     tools: { register(t: unknown): void }
@@ -164,6 +251,9 @@ export function apply(_ctx: Context, config: { distro?: string; enableRunInBackg
   }
   const configuredDistro = typeof config.distro === 'string' && config.distro ? config.distro : DEFAULT_DISTRO
   const backgroundEnabled = config.enableRunInBackground ?? true
+  const daemonEnabled = config.runtime === 'daemon'
+  const daemonHost = config.daemon?.host ?? '127.0.0.1'
+  const daemonPort = config.daemon?.port ?? 37778
   const maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES
 
   const collect = (maxBytes: number) => ({ maxBytes, spill: { maxBytes } })
@@ -180,10 +270,13 @@ export function apply(_ctx: Context, config: { distro?: string; enableRunInBackg
 
   ctx.tools.register(defineTool({
     name: 'wsl',
-    description: 'Execute a command inside a WSL distro via wsl.exe and return its stdout/stderr. ' +
+    description: 'Execute a command inside a WSL distro and return its stdout/stderr. ' +
       'Use this for WSL workspaces (paths under \\\\wsl.localhost\\... or \\\\wsl$\\...); the session workspace is ' +
-      'translated to its in-distro Linux path for --cd. Each call runs in a fresh bash shell: no state persists ' +
-      'between calls — pass "workdir" instead of using "cd". Non-zero exits are reported as "[exit code: N]". ' +
+      'translated to its in-distro Linux path. ' +
+      (daemonEnabled
+        ? 'Commands run against a RESIDENT bash session in WSL via the exec-server; state (cd, exports) persists across calls, so "cd" and environment changes survive.'
+        : 'Each call bridges into WSL via wsl.exe in a fresh bash shell: no state persists between calls — pass "workdir" instead of using "cd".') +
+      ' Non-zero exits are reported as "[exit code: N]". ' +
       (backgroundEnabled
         ? 'Set "run_in_background: true" for long-running commands: the call returns a job id immediately; read its output with "job_output" and stop it with "job_kill".'
         : 'Background execution is not available; long-running commands must finish within the timeout.'),
@@ -240,6 +333,34 @@ export function apply(_ctx: Context, config: { distro?: string; enableRunInBackg
       const argv = wslArgv(distro, linuxPath, script, args.command)
 
       const timeoutMs = clampTimeout(args.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, 'request.timeoutMs')
+
+      // Resident-execution path: send foreground commands to the WSL exec-server
+      // instead of bridging wsl.exe per call. State persists across these calls.
+      if (daemonEnabled && args.run_in_background !== true) {
+        if (args.env) {
+          for (const [k, v] of Object.entries(args.env)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
+        }
+        try {
+          const r = await runViaDaemon(daemonHost, daemonPort, {
+            cmd: args.command,
+            workdir: linuxPath || '/',
+            env: dshEnv,
+            timeoutMs,
+          })
+          return {
+            kind: 'foreground',
+            exitCode: r.exitCode,
+            signal: r.signal,
+            timedOut: r.timedOut,
+            aborted: false,
+            timeoutMs,
+            stdout: { text: r.stdout, truncated: false },
+            stderr: { text: r.stderr, truncated: false },
+          }
+        } catch (e) {
+          throw new Error(`wsl daemon not reachable at ${daemonHost}:${daemonPort} — start it from WSL with daemon/launch.sh (${(e as Error).message})`)
+        }
+      }
 
       const spawnSpec = {
         argv,
