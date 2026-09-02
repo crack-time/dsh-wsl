@@ -261,7 +261,10 @@ export function apply(_ctx: Context, config: {
   }
   const configuredDistro = typeof config.distro === 'string' && config.distro ? config.distro : DEFAULT_DISTRO
   const backgroundEnabled = config.enableRunInBackground ?? true
-  const daemonEnabled = config.runtime === 'daemon'
+  // daemon is the preferred execution mode (resident, state persists); an
+  // explicit runtime: 'bridge' opts out. When no runtime is set, daemon wins
+  // and falls back to the bridge if the daemon is unreachable.
+  const daemonEnabled = config.runtime !== 'bridge'
   const daemonHost = config.daemon?.host ?? '127.0.0.1'
   const daemonPort = config.daemon?.port ?? 37778
   const maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES
@@ -344,8 +347,10 @@ export function apply(_ctx: Context, config: {
 
       const timeoutMs = clampTimeout(args.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, 'request.timeoutMs')
 
-      // Resident-execution path: send foreground commands to the WSL exec-server
-      // instead of bridging wsl.exe per call. State persists across these calls.
+      // Resident-execution path (preferred): send foreground commands to the WSL
+      // exec-server instead of bridging wsl.exe per call. If the daemon is not
+      // reachable, gracefully fall back to the one-shot bridge rather than fail.
+      let daemonFallbackNote: string | undefined
       if (daemonEnabled && args.run_in_background !== true) {
         if (args.env) {
           for (const [k, v] of Object.entries(args.env)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
@@ -373,7 +378,8 @@ export function apply(_ctx: Context, config: {
             stderr: { text: r.stderr, truncated: false },
           }
         } catch (e) {
-          throw new Error(`wsl daemon not reachable at ${daemonHost}:${daemonPort} — start it from WSL with daemon/launch.sh (${(e as Error).message})`)
+          // Daemon unavailable → note it and fall through to the bridge path.
+          daemonFallbackNote = `[wsl daemon unreachable at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e as Error).message})`
         }
       }
 
@@ -439,6 +445,9 @@ export function apply(_ctx: Context, config: {
         const aborted = d.signal.aborted && !timedOut
         const stdout = handle.collected.stdout ? finalOutput(handle.collected.stdout) : { text: '', truncated: false }
         const stderr = handle.collected.stderr ? finalOutput(handle.collected.stderr) : { text: '', truncated: false }
+        if (daemonFallbackNote) {
+          stdout.text = `${daemonFallbackNote}\n${stdout.text}`
+        }
         if (d.signal.aborted) await handle.waitForExit(d.signal).catch(() => {})
         if (aborted) {
           const error = new HarnessError('tool call aborted', TOOL_ABORTED)

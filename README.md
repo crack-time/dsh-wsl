@@ -76,6 +76,11 @@ bash ~/.dshwsl/launch.sh          # or: cd ~/.dshwsl && setsid nohup ~/.zcode/se
 then point the preset's `tool-wsl` row at it:
 
 ```yaml
+# daemon is the preferred runtime for `@crack/dsh-wsl/tool`: when the config
+# omits `runtime` (or sets 'daemon'), commands go to the resident exec-server
+# and fall back to the one-shot bridge automatically if the daemon is
+# unreachable. Set `runtime: 'bridge'` to force per-call wsl.exe.
+
 - id: tool-wsl
   name: '@crack/dsh-wsl/tool'
   config:
@@ -86,7 +91,9 @@ then point the preset's `tool-wsl` row at it:
 
 Background (`run_in_background`) requests still bridge via `wsl.exe`. In
 `daemon` mode, a hard timeout terminates and respawns the persistent shell
-(state lost only on timeout).
+(state lost only on timeout); when the daemon is not reachable the call falls
+back to the one-shot bridge with a note in the output (state does not persist
+for that call).
 
 ## Requirements
 
