@@ -124,7 +124,15 @@ export function apply(ctx: ClientContext): void {
     if (!btn) return
     showMenu(
       btn,
-      () => { passthrough = true; btn.click() },
+      () => {
+        passthrough = true
+        btn.click()
+        // Re-arm interception after this one-shot replay: `btn.click()` is
+        // synchronous, so React's bubble handler opens the native picker within
+        // this same dispatch; resetting on a following timeout restores the
+        // menu for the next click instead of latching it to Windows forever.
+        setTimeout(() => { passthrough = false }, 0)
+      },
       () => {
         browserCleanup?.()
         browserCleanup = mountBrowser()
