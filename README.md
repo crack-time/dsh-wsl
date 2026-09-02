@@ -60,7 +60,7 @@ The `daemon/` directory ships the P0 implementation:
 
 | file | role |
 |---|---|
-| `daemon/exec-server.js` | resident bash execution machine (zero-dependency Node, runs on `~/.zcode/server/node` v22 inside WSL) |
+| `daemon/exec-server.js` | resident bash execution machine (zero-dependency Node; the launcher resolves the Node binary — linuxbrew preferred, `~/.zcode/server/node` fallback) |
 | `daemon/launch.sh` | detach + revive helper; resolves Node by preference (`node` on PATH → linuxbrew `~/.linuxbrew/bin/node` → bundled `~/.zcode/server/node` fallback), `setsid nohup`, writes `daemon.pid` |
 | `daemon/dshwsl-env.bash` | BASH_ENV bootstrap for the persistent bash: reproduces `~/.bashrc`'s exported env (linuxbrew, conda, cuda/lammps PATH) bypassing its non-interactive guard, so brew/node/npm/conda are callable from `wsl` commands |
 | `daemon/client.cjs` | Windows-side test client (`node daemon/client.cjs`) |
@@ -69,10 +69,34 @@ The daemon listens on `127.0.0.1:37778`; Windows reaches it through WSL2's
 automatic localhost forwarding (the model + UI loop stay in Windows). To use
 it:
 
+### Deploy the daemon to WSL
+
+The `daemon/` files are the runtime payload; they are **not** auto-installed
+into WSL. Deploy them once from a clone of this repo (WSL <-> Windows:
+`\\wsl.localhost\<distro>\home\<user>\...`):
+
 ```bash
-# inside WSL: start the resident exec-server once
-bash ~/.dshwsl/launch.sh          # or: cd ~/.dshwsl && setsid nohup ~/.zcode/server/node exec-server.js &
+# on Windows, from the repo root — copy the three runtime files into WSL
+$d = '\\wsl.localhost\Ubuntu-22.04\home\<you>\.dshwsl'
+New-Item -ItemType Directory -Force -Path $d | Out-Null
+Copy-Item daemon/exec-server.js, daemon/launch.sh, daemon/dshwsl-env.bash $d
 ```
+
+Then start it once (inside WSL; keep the LF line endings):
+
+```bash
+bash ~/.dshwsl/launch.sh          # resolve+detach+start; writes daemon.pid
+```
+
+Or run via a single cross-boundary call from Windows (the tool's runtime also
+auto-starts the daemon on first unreachable call, but a warm start avoids the
+wait):
+
+```powershell
+wsl -d Ubuntu-22.04 -- bash -lc 'bash "$HOME/.dshwsl/launch.sh"'
+```
+
+### Point the preset at the daemon
 
 then point the preset's `tool-wsl` row at it:
 
