@@ -298,6 +298,92 @@ function makeDaemonBackgroundHandle(host: string, port: number, token: string | 
     },
   }
 }
+
+// ── backend strategy: two execution backends + a daemon-first coordinator ───
+// A "foreground value" is the tool's model-facing foreground result object.
+type FgValue = {
+  kind: 'foreground'
+  exitCode: number | null
+  signal: string | null
+  timedOut: boolean
+  aborted: boolean
+  timeoutMs: number
+  stdout: { text: string; truncated: boolean }
+  stderr: { text: string; truncated: boolean }
+}
+/** Daemon backend outcome: a real result, or a note signalling bridge fallback. */
+type DaemonOutcome = { value: FgValue } | { note: string }
+
+interface DaemonForegroundDeps {
+  ctx: {
+    shellEnv: { collect(exec: unknown): Record<string, string> }
+    subprocess: { spawn(spec: unknown): any }
+  }
+  exec: { signal: AbortSignal }
+  distro: string
+  linuxPath: string
+  args: { command: string; workdir?: string; env?: Record<string, string | undefined> }
+  dshEnv: Record<string, string>
+  timeoutMs: number
+  daemonHost: string
+  daemonPort: number
+  daemonToken?: string
+  daemonAutoStart: boolean
+}
+
+/** The daemon execution backend: persistent shell via the resident exec-server. */
+async function runDaemonForegroundBackend(d: DaemonForegroundDeps): Promise<DaemonOutcome> {
+  const { ctx, exec, distro, linuxPath, args, dshEnv, timeoutMs, daemonHost, daemonPort, daemonToken, daemonAutoStart } = d
+  if (args.env) {
+    for (const [k, v] of Object.entries(args.env)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
+  }
+  const daemonReq = {
+    cmd: args.command,
+    session: linuxPath || '/',
+    initWorkdir: linuxPath || '/',
+    workdir: args.workdir !== void 0 ? linuxPath : undefined,
+    env: dshEnv,
+    timeoutMs,
+    token: daemonToken,
+  }
+  const toValue = (r: DaemonResult): FgValue => ({
+    kind: 'foreground' as const,
+    exitCode: r.exitCode,
+    signal: r.signal,
+    timedOut: r.timedOut,
+    aborted: false,
+    timeoutMs,
+    stdout: { text: r.stdout, truncated: false },
+    stderr: { text: r.stderr, truncated: false },
+  })
+  try {
+    // Per-workspace persistent shell: key by the workspace's Linux path, seed it
+    // once to that path, only override cwd when the model explicitly passed a
+    // workdir — so `cd` inside a prior command persists.
+    return { value: toValue(await runViaDaemon(daemonHost, daemonPort, daemonReq)) }
+  } catch (e) {
+    const now = Date.now()
+    if (daemonAutoStart && now - lastDaemonStart >= DAEMON_AUTO_START_THROTTLE_MS) {
+      lastDaemonStart = now
+      if (!daemonLaunching) {
+        daemonLaunching = (async () => {
+          try { await deployDaemonPayload(ctx, distro, exec.signal) } catch {}
+          try { await launchDaemonViaWsl(ctx, distro, exec.signal, daemonToken) } catch {}
+          await sleep(DAEMON_START_WAIT_MS)
+        })()
+        daemonLaunching.catch(() => {}).finally(() => { daemonLaunching = null })
+      }
+      await daemonLaunching
+      try {
+        return { value: toValue(await runViaDaemon(daemonHost, daemonPort, daemonReq)) }
+      } catch (e2) {
+        return { note: `[wsl daemon unreachable after auto-start at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e2 as Error).message})` }
+      }
+    }
+    return { note: `[wsl daemon unreachable at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e as Error).message})` }
+  }
+}
+
 // exec-server detached (setsid nohup + </dev/null + disown) with an optional
 // shared secret. The trailing `sleep 2` keeps the parent bash alive long
 // enough for setsid to fully detach so the process survives the wsl.exe client
@@ -519,76 +605,16 @@ export function apply(_ctx: Context, config: {
 
       const timeoutMs = clampTimeout(args.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, 'request.timeoutMs')
 
-      // Resident-execution path (preferred): send foreground commands to the WSL
-      // exec-server instead of bridging wsl.exe per call. If the daemon is not
-      // reachable, auto-start it (throttled) and retry once; only if that still
-      // fails do we gracefully fall back to the one-shot bridge.
+      // Resident-execution path (preferred): the daemon backend first, with automatic
+      // bridge fallback (daemon-first coordinator). Daemon preferred, bridge kept.
       let daemonFallbackNote: string | undefined
       if (daemonEnabled && args.run_in_background !== true) {
-        if (args.env) {
-          for (const [k, v] of Object.entries(args.env)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
-        }
-        // Rebuild the daemon request (dshEnv may have grown above).
-        const daemonReq = {
-          cmd: args.command,
-          session: linuxPath || '/',
-          initWorkdir: linuxPath || '/',
-          workdir: args.workdir !== void 0 ? linuxPath : undefined,
-          env: dshEnv,
-          timeoutMs,
-          token: daemonToken,
-        }
-        try {
-          // Per-workspace persistent shell: key by the workspace's Linux path,
-          // seed it once to that path, and only override cwd when the model
-          // explicitly passed a workdir — so `cd` inside a prior command persists.
-          const r = await runViaDaemon(daemonHost, daemonPort, daemonReq)
-          return {
-            kind: 'foreground',
-            exitCode: r.exitCode,
-            signal: r.signal,
-            timedOut: r.timedOut,
-            aborted: false,
-            timeoutMs,
-            stdout: { text: r.stdout, truncated: false },
-            stderr: { text: r.stderr, truncated: false },
-          }
-        } catch (e) {
-          // Daemon unreachable. Try to self-launch it (first time, throttled) and
-          // retry once; if still unreachable, note and fall through to the bridge.
-          const now = Date.now()
-          if (daemonAutoStart && now - lastDaemonStart >= DAEMON_AUTO_START_THROTTLE_MS) {
-            lastDaemonStart = now
-            if (!daemonLaunching) {
-              daemonLaunching = (async () => {
-                try { await deployDaemonPayload(ctx, distro, exec.signal) } catch {}
-                try { await launchDaemonViaWsl(ctx, distro, exec.signal, daemonToken) } catch {}
-                await sleep(DAEMON_START_WAIT_MS)
-              })()
-              daemonLaunching.catch(() => {}).finally(() => { daemonLaunching = null })
-            }
-            const inFlight = daemonLaunching
-            await inFlight
-            try {
-              const r2 = await runViaDaemon(daemonHost, daemonPort, daemonReq)
-              daemonFallbackNote = undefined
-              return {
-                kind: 'foreground',
-                exitCode: r2.exitCode,
-                signal: r2.signal,
-                timedOut: r2.timedOut,
-                aborted: false,
-                timeoutMs,
-                stdout: { text: r2.stdout, truncated: false },
-                stderr: { text: r2.stderr, truncated: false },
-              }
-            } catch (e2) {
-              daemonFallbackNote = `[wsl daemon unreachable after auto-start at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e2 as Error).message})`
-            }
-          } else {
-            daemonFallbackNote = `[wsl daemon unreachable at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e as Error).message})`
-          }
-        }
+        const outcome = await runDaemonForegroundBackend({
+          ctx, exec, distro, linuxPath, args, dshEnv, timeoutMs,
+          daemonHost, daemonPort, daemonToken, daemonAutoStart,
+        })
+        if ('value' in outcome) return outcome.value
+        daemonFallbackNote = outcome.note
       }
 
       const spawnSpec = {
