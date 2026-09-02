@@ -3,9 +3,10 @@
  * @crack/dsh-wsl/daemon/exec-server — resident bash execution machine for WSL.
  *
  * P0 POC. Runs INSIDE a WSL distro as a long-lived process holding ONE
- * persistent `bash` child. `cd` / `export` survive across commands because
- * the shell never exits — that is the entire point vs. the one-shot
- * `wsl.exe ... bash -lc` bridge.
+ * persistent `bash` child shared across ALL connections. `cd` / `export`
+ * survive across commands AND across connections because the shell never
+ * exits — that is the entire point vs. the one-shot `wsl.exe ... bash -lc`
+ * bridge (and the dsh `wsl` tool opens a fresh TCP connection per call).
  *
  * Transport: newline-delimited JSON over a 127.0.0.1 TCP socket. Windows
  * reaches it through WSL2's automatic localhost forwarding, so the plugin
@@ -21,14 +22,21 @@
  *
  * Framing: each request's script ends with `echo $? >&3`, where fd3 is a
  * dedicated pipe the daemon watches for the exit code. stdout/stderr pipes
- * therefore carry only the command's own output. Requests run sequentially.
+ * therefore carry only the command's own output.
+ *
+ * Concurrency + recovery:
+ * - ONE shared low-level `PersistentShell`, executed through a global promise
+ *   queue so requests from concurrent connections serialize (state is not
+ *   per-connection, and responses can not interleave).
+ * - A hard timeout kills (SIGKILL) the wedged bash and marks it closed; the
+ *   next request lazily respawns it, so a malformed command self-heals after
+ *   its timeout (state lost only on a timeout).
  *
  * Zero npm dependencies (works under the bundled ~/.zcode/server/node v22).
  * Deliberately NOT a full dsh agent composition yet — Milestone 1 proves the
  * resident-execution + persistent-state mechanics end to end.
  *
- * Limitations (P0): no pty, so interactive stdin tools behave unpredictably;
- * a hard timeout terminates and respawns bash (state lost on timeout only).
+ * Limitations (P0): no pty, so interactive stdin tools behave unpredictably.
  */
 'use strict';
 const net = require('node:net');
@@ -39,54 +47,69 @@ const BASH = process.env.DSHWSL_BASH || '/bin/bash';
 const DEFAULT_TIMEOUT_MS = 120000;
 const MAX_OUTPUT_CHARS = 64 * 1024;
 
-function bail(msg) {
-  process.stderr.write(`[exec-server] ${msg}\n`);
-  process.exit(1);
-}
-
-/** Quotes a string for safe interpolation into a single bash `-c` style block. */
+/** Quotes a string for safe interpolation into a single bash brace block. */
 function sq(v) {
   return `'${String(v).replaceAll("'", `'\\''`)}'`;
 }
 
+function trimSpill(s, max = MAX_OUTPUT_CHARS) {
+  return s.length >= max ? `${s}\n[output truncated]` : s;
+}
+
+/**
+ * One persistent bash child, shared across all connections. All requests run
+ * through `runRequest`, which is serialized by a global promise chain so a
+ * single stdout/stderr listener window and the single fd3 `_exitWait` slot
+ * are never contended.
+ */
 class PersistentShell {
   constructor() {
+    this._queue = Promise.resolve();
+    this._spawn();
+  }
+
+  _spawn() {
     // stdio[3] is the exit-code sentinel pipe.
     this.proc = spawn(BASH, ['--noprofile', '--norc', '--noediting'], {
       stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
     });
-    this.pid = this.proc.pid;
-    this.pendingExitRead = null; // {resolve}
     this.closed = false;
+    this._exitWait = null;
     this.proc.on('error', () => { this.closed = true; });
     this.proc.on('exit', (code, signal) => {
       this.closed = true;
-      if (this._exitWait) {
-        this._exitWait.resolve({ exitCode: code, signal });
-        this._exitWait = null;
-      }
+      const w = this._exitWait;
+      this._exitWait = null;
+      if (w) w.resolve({ exitCode: code, signal });
     });
-    // fd3 line-mode reader → exit codes.
     this.proc.stdio[3].setEncoding('utf8');
-    this._exitWait = null;
     this.proc.stdio[3].on('data', (d) => {
-      const lines = d.split('\n');
-      for (const raw of lines) {
+      for (const raw of d.split('\n')) {
         const line = raw.replace(/\r$/, '').trim();
         if (line === '' || !/^-?\d+$/.test(line)) continue;
-        const code = Number(line);
         const w = this._exitWait;
         this._exitWait = null;
-        if (w) w.resolve({ exitCode: code, signal: null });
+        if (w) w.resolve({ exitCode: Number(line), signal: null });
       }
     });
   }
 
-  /**
-   * Run one command against the persistent shell. Sequential by construction:
-   * the caller must not interleave two run() calls on the same shell.
-   */
-  runCommand({ cmd, workdir, env, timeoutMs }) {
+  ensureAlive() {
+    if (this.closed) {
+      this._spawn();
+    }
+    return this;
+  }
+
+  /** Serialized, global: only one bash script writes to stdin at a time. */
+  runRequest(req) {
+    const task = this.ensureAlive()._exec(req);
+    const run = this._queue.then(() => task);
+    this._queue = run.then(() => {}, () => {});
+    return run;
+  }
+
+  _exec({ cmd, workdir, env, timeoutMs }) {
     const script = [
       env && Object.keys(env).length
         ? Object.entries(env)
@@ -100,29 +123,37 @@ class PersistentShell {
     ].filter(Boolean).join('\n');
 
     return new Promise((resolve) => {
-      if (this.closed) {
-        resolve({ ok: false, error: 'shell closed' });
-        return;
-      }
       let stdout = '';
       let stderr = '';
-      const onOut = (d) => { if (stdout.length < MAX_OUTPUT_CHARS) stdout += d; };
-      const onErr = (d) => { if (stderr.length < MAX_OUTPUT_CHARS) stderr += d; };
+      const onOut = (d) => { stdout += d; };
+      const onErr = (d) => { stderr += d; };
+      let settled = false;
       this.proc.stdout.on('data', onOut);
       this.proc.stderr.on('data', onErr);
 
-      const finish = (exitCode, signal) => {
+      const cleanup = () => {
         this.proc.stdout.off('data', onOut);
         this.proc.stderr.off('data', onErr);
-        clearTimeout(selfTimeout);
-        const trimmed = (s) => (stdout.length >= MAX_OUTPUT_CHARS ? `${s}\n[output truncated]` : s);
-        resolve({ ok: true, done: true, exitCode, signal, stdout: trimmed(stdout), stderr: trimmed(stderr) });
+        clearTimeout(timer);
+      };
+      const finish = (exitCode, signal) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ ok: true, done: true, exitCode, signal, stdout: trimSpill(stdout), stderr: trimSpill(stderr) });
+      };
+      const err = (message) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ ok: false, error: message });
       };
 
-      const selfTimeout = setTimeout(() => {
-        // Hard timeout: kill+respawn the persistent shell (state lost).
-        this.proc.kill('SIGKILL');
-        resolve({ ok: false, error: `timed out after ${timeoutMs}ms`, timeout: true });
+      const timer = setTimeout(() => {
+        // Hard timeout: kill + close; the next request respawns a fresh shell.
+        try { this.proc.kill('SIGKILL'); } catch {}
+        this.closed = true;
+        err(`timed out after ${timeoutMs}ms`);
       }, timeoutMs);
 
       this._exitWait = { resolve: (r) => finish(r.exitCode, r.signal) };
@@ -131,15 +162,23 @@ class PersistentShell {
   }
 
   dispose() {
-    if (this.closed) return;
     this.closed = true;
-    this.proc.kill('SIGKILL');
+    try { this.proc.kill('SIGKILL'); } catch {}
   }
+}
+
+// ONE shell for the daemon's whole lifetime (NOT per-connection).
+let sharedShell = null;
+function getShell() {
+  if (!sharedShell || sharedShell.closed) {
+    if (sharedShell) { try { sharedShell.dispose(); } catch {} }
+    sharedShell = new PersistentShell();
+  }
+  return sharedShell;
 }
 
 const server = net.createServer((socket) => {
   let buffer = '';
-  let shell = null;
   let busy = false;
   const queue = [];
 
@@ -149,21 +188,18 @@ const server = net.createServer((socket) => {
   function pump() {
     if (busy || queue.length === 0) return;
     const req = queue.shift();
-    if (!shell) shell = new PersistentShell();
     busy = true;
-    shell
-      .runCommand(req)
-      .then((res) => {
-        if (res.ok) {
-          if (res.stdout) send({ id: req.id, channel: 'stdout', text: res.stdout });
-          if (res.stderr) send({ id: req.id, channel: 'stderr', text: res.stderr });
-          send({ id: req.id, done: true, exitCode: res.exitCode, signal: res.signal });
-        } else {
-          send({ id: req.id, done: true, exitCode: null, signal: null, error: res.error });
-        }
-        busy = false;
-        pump();
-      });
+    getShell().runRequest(req).then((res) => {
+      if (res.ok) {
+        if (res.stdout) send({ id: req.id, channel: 'stdout', text: res.stdout });
+        if (res.stderr) send({ id: req.id, channel: 'stderr', text: res.stderr });
+        send({ id: req.id, done: true, exitCode: res.exitCode, signal: res.signal });
+      } else {
+        send({ id: req.id, done: true, exitCode: null, signal: null, error: res.error });
+      }
+      busy = false;
+      pump();
+    });
   }
 
   socket.on('data', (chunk) => {
@@ -192,7 +228,7 @@ const server = net.createServer((socket) => {
 
   socket.on('error', () => {});
   socket.on('close', () => {
-    if (shell) shell.dispose();
+    // NOTE: do NOT dispose the shared shell here — it is daemon-lifetime.
   });
 });
 
@@ -200,5 +236,5 @@ server.listen(PORT, '127.0.0.1', () => {
   process.stdout.write(`[exec-server] listening on 127.0.0.1:${PORT} (pid ${process.pid})\n`);
 });
 
-process.on('SIGTERM', () => { process.exit(0); });
-process.on('SIGINT', () => { process.exit(0); });
+process.on('SIGTERM', () => { if (sharedShell) sharedShell.dispose(); process.exit(0); });
+process.on('SIGINT', () => { if (sharedShell) sharedShell.dispose(); process.exit(0); });
