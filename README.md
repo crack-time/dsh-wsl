@@ -92,9 +92,11 @@ then point the preset's `tool-wsl` row at it:
 
 Background (`run_in_background`) requests still bridge via `wsl.exe`. In
 `daemon` mode, a hard timeout terminates and respawns the persistent shell
-(state lost only on timeout); when the daemon is not reachable the call falls
-back to the one-shot bridge with a note in the output (state does not persist
-for that call).
+(state lost only on timeout). If the daemon is not reachable, the tool
+**auto-starts it** (spawning a detached `setsid nohup ... exec-server.js` via
+`wsl.exe`, throttled) and retries once, then falls back to the one-shot bridge
+with a note in the output only if the start/reach still fails. `launch.sh` is
+then just a manual convenience, not a requirement.
 
 ## Requirements
 

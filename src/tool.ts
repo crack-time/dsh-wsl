@@ -167,6 +167,53 @@ function runViaDaemon(host: string, port: number, req: {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon auto-start (self-contained; no dependency on daemon/launch.sh)
+// ---------------------------------------------------------------------------
+// State is module-level so concurrent sessions in the host process share one
+// in-flight launch and a throttle window (we don't hammer wsl.exe per call).
+let daemonLaunching: Promise<void> | null = null
+let lastDaemonStart = 0
+const DAEMON_AUTO_START_THROTTLE_MS = 15000
+const DAEMON_START_WAIT_MS = 3500
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+// Bash one-liner, spawn via `wsl.exe -d <distro> -- bash -lc <this>`.
+// Resolves a node by preference, cd's into ~/.dshwsl, and starts the
+// exec-server detached (setsid nohup + </dev/null + disown). The trailing
+// `sleep 2` keeps the parent bash alive long enough for setsid to fully
+// detach so the process survives the wsl.exe client exiting — without it the
+// daemon is reaped on exit. `$VAR` stays literal for bash (JS only expands
+// `${`). Mirrors daemon/launch.sh so the tool is self-sufficient without it.
+const DAEMON_LAUNCH_BASH = [
+  'cd "$HOME/.dshwsl" 2>/dev/null || { echo "dsh-wsl: ~/.dshwsl missing" >&2; exit 2; }',
+  'if command -v node >/dev/null 2>&1; then NODE="$(command -v node)"; elif [ -x /home/linuxbrew/.linuxbrew/bin/node ]; then NODE="/home/linuxbrew/.linuxbrew/bin/node"; elif [ -x "$HOME/.zcode/server/node" ]; then NODE="$HOME/.zcode/server/node"; else echo "dsh-wsl: no node in WSL" >&2; exit 3; fi',
+  '[ -f exec-server.js ] || { echo "dsh-wsl: daemon payload missing (run daemon/launch.sh once)" >&2; exit 4; }',
+  'setsid nohup "$NODE" exec-server.js > exec.log 2>&1 < /dev/null & disown 2>/dev/null || true',
+  'sleep 2',
+].join('; ')
+
+async function launchDaemonViaWsl(ctx: { subprocess: { spawn(spec: unknown): any } }, distro: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    const handle = ctx.subprocess.spawn({
+      argv: ['wsl.exe', '-d', distro, '--', 'bash', '-lc', DAEMON_LAUNCH_BASH],
+      cwd: process.cwd(),
+      stdio: {
+        stdin: 'ignore' as const,
+        stdout: { maxBytes: 4096 },
+        stderr: { maxBytes: 4096 },
+      },
+      graceMs: 2000,
+      ...(signal ? { signal } : {}),
+    })
+    await handle.done
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Stream + result projection (mirror @deepseek-ai/dsh-tool-bash)
 // ---------------------------------------------------------------------------
 function finalOutput(reader: { readFrom(from: number): { text: string; lossy: boolean; spillPath?: string } }): {
@@ -250,7 +297,7 @@ export function apply(_ctx: Context, config: {
   /** 'bridge' (default) spawns wsl.exe per call; 'daemon' sends commands to a resident WSL exec-server. */
   runtime?: 'bridge' | 'daemon'
   /** Connection target when runtime === 'daemon'. host/port default to the localhost-forwarded WSL2 target. */
-  daemon?: { host?: string; port?: number }
+  daemon?: { host?: string; port?: number; autoStart?: boolean }
 } = {}): void {
   const ctx = _ctx as unknown as {
     systemPrompt: { section(o: unknown): void; getSectionOrder(n: string): number }
@@ -267,6 +314,9 @@ export function apply(_ctx: Context, config: {
   const daemonEnabled = config.runtime !== 'bridge'
   const daemonHost = config.daemon?.host ?? '127.0.0.1'
   const daemonPort = config.daemon?.port ?? 37778
+  // On first unreachable call, self-launch the daemon via wsl.exe (then retry
+  // once) instead of only falling back to the bridge. Default on.
+  const daemonAutoStart = config.daemon?.autoStart ?? true
   const maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES
 
   const collect = (maxBytes: number) => ({ maxBytes, spill: { maxBytes } })
@@ -349,24 +399,27 @@ export function apply(_ctx: Context, config: {
 
       // Resident-execution path (preferred): send foreground commands to the WSL
       // exec-server instead of bridging wsl.exe per call. If the daemon is not
-      // reachable, gracefully fall back to the one-shot bridge rather than fail.
+      // reachable, auto-start it (throttled) and retry once; only if that still
+      // fails do we gracefully fall back to the one-shot bridge.
       let daemonFallbackNote: string | undefined
       if (daemonEnabled && args.run_in_background !== true) {
         if (args.env) {
           for (const [k, v] of Object.entries(args.env)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
         }
+        // Rebuild the daemon request (dshEnv may have grown above).
+        const daemonReq = {
+          cmd: args.command,
+          session: linuxPath || '/',
+          initWorkdir: linuxPath || '/',
+          workdir: args.workdir !== void 0 ? linuxPath : undefined,
+          env: dshEnv,
+          timeoutMs,
+        }
         try {
           // Per-workspace persistent shell: key by the workspace's Linux path,
           // seed it once to that path, and only override cwd when the model
           // explicitly passed a workdir — so `cd` inside a prior command persists.
-          const r = await runViaDaemon(daemonHost, daemonPort, {
-            cmd: args.command,
-            session: linuxPath || '/',
-            initWorkdir: linuxPath || '/',
-            workdir: args.workdir !== void 0 ? linuxPath : undefined,
-            env: dshEnv,
-            timeoutMs,
-          })
+          const r = await runViaDaemon(daemonHost, daemonPort, daemonReq)
           return {
             kind: 'foreground',
             exitCode: r.exitCode,
@@ -378,8 +431,39 @@ export function apply(_ctx: Context, config: {
             stderr: { text: r.stderr, truncated: false },
           }
         } catch (e) {
-          // Daemon unavailable → note it and fall through to the bridge path.
-          daemonFallbackNote = `[wsl daemon unreachable at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e as Error).message})`
+          // Daemon unreachable. Try to self-launch it (first time, throttled) and
+          // retry once; if still unreachable, note and fall through to the bridge.
+          const now = Date.now()
+          if (daemonAutoStart && now - lastDaemonStart >= DAEMON_AUTO_START_THROTTLE_MS) {
+            lastDaemonStart = now
+            if (!daemonLaunching) {
+              daemonLaunching = (async () => {
+                try { await launchDaemonViaWsl(ctx, distro, exec.signal) } catch {}
+                await sleep(DAEMON_START_WAIT_MS)
+              })()
+              daemonLaunching.catch(() => {}).finally(() => { daemonLaunching = null })
+            }
+            const inFlight = daemonLaunching
+            await inFlight
+            try {
+              const r2 = await runViaDaemon(daemonHost, daemonPort, daemonReq)
+              daemonFallbackNote = undefined
+              return {
+                kind: 'foreground',
+                exitCode: r2.exitCode,
+                signal: r2.signal,
+                timedOut: r2.timedOut,
+                aborted: false,
+                timeoutMs,
+                stdout: { text: r2.stdout, truncated: false },
+                stderr: { text: r2.stderr, truncated: false },
+              }
+            } catch (e2) {
+              daemonFallbackNote = `[wsl daemon unreachable after auto-start at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e2 as Error).message})`
+            }
+          } else {
+            daemonFallbackNote = `[wsl daemon unreachable at ${daemonHost}:${daemonPort} — fell back to one-shot bridge; state will NOT persist this call] (${(e as Error).message})`
+          }
         }
       }
 

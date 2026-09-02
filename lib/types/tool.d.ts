@@ -10,5 +10,6 @@ export declare function apply(_ctx: Context, config?: {
     daemon?: {
         host?: string;
         port?: number;
+        autoStart?: boolean;
     };
 }): void;
