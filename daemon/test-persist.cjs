@@ -34,7 +34,7 @@ function command(req) {
         else if (f.done) { clearTimeout(t); socket.end(); out.done = f; resolve(out); }
       }
     });
-    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, workdir: req.workdir, timeoutMs: req.timeoutMs }) + '\n');
+    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs }) + '\n');
     const wait = req.timeoutMs && req.timeoutMs > 0 ? req.timeoutMs : 30000;
     const t = setTimeout(() => { socket.destroy(); reject(new Error('reply timeout')); }, wait + 8000);
   });
@@ -73,4 +73,19 @@ function show(r) {
   console.log(r.stdout.includes('out1') && !r.stdout.includes('err1') && r.done.exitCode === 9
     ? '  ✔ stderr separated, exit 9 propagated'
     : '  ✘ separation/exitcode wrong');
+
+  section('4. env passthrough (the tool sends dshEnv via the env field)');
+  r = await command({ id: 6, cmd: 'echo "FOO=$FOO BAR=$BAR"', env: { FOO: 'alpha', BAR: 'beta' } });
+  show(r);
+  console.log(r.stdout.includes('FOO=alpha') && r.stdout.includes('BAR=beta') && !r.stdout.includes('undefined')
+    ? '  ✔ env exported into the persistent bash'
+    : '  ✘ env export wrong');
+
+  section('5. large output must complete (not wedge)');
+  r = await command({ id: 7, cmd: 'head -c 300000 /dev/zero | tr "\\0" x; echo DONE:$(wc -c </dev/null >/dev/null; echo ok)' });
+  console.log(`  reply stdout len=${r.stdout.length}, exit=${r.done.exitCode}, error=${r.done.error || 'none'}`);
+  console.log((r.done.exitCode === 0 || r.done.error === void 0) && r.stdout.length > 0
+    ? '  ✔ large output settled, no hang'
+    : '  ✘ large output did not settle');
+
 })().catch((e) => { console.error('FATAL ' + e.message); process.exit(1); });

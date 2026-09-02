@@ -125,8 +125,8 @@ class PersistentShell {
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
-      const onOut = (d) => { stdout += d; };
-      const onErr = (d) => { stderr += d; };
+      const onOut = (d) => { if (stdout.length < MAX_OUTPUT_CHARS) stdout += d; };
+      const onErr = (d) => { if (stderr.length < MAX_OUTPUT_CHARS) stderr += d; };
       let settled = false;
       this.proc.stdout.on('data', onOut);
       this.proc.stderr.on('data', onErr);
