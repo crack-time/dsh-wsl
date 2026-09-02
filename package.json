@@ -38,7 +38,12 @@
     "lib/client.js.map",
     "lib/index.js",
     "lib/tool.js",
+    "lib/wsl-util.js",
     "lib/types",
+    "daemon/exec-server.js",
+    "daemon/launch.sh",
+    "daemon/dshwsl-env.bash",
+    "scripts",
     "cordis.patch.yml"
   ],
   "devDependencies": {

@@ -24,6 +24,10 @@
  * wrap differ (Linux-side work cannot be confined by the Windows ACL sandbox).
  */
 import { connect } from 'node:net'
+import { readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { TOOL_ABORTED } from '@deepseek-ai/dsh-tools'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
@@ -159,6 +163,57 @@ const DAEMON_AUTO_START_THROTTLE_MS = 15000
 const DAEMON_START_WAIT_MS = 3500
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+// The three runtime files the resident exec-server needs inside WSL (~/.dshwsl).
+const DAEMON_PAYLOAD = ['daemon/exec-server.js', 'daemon/launch.sh', 'daemon/dshwsl-env.bash'] as const
+
+/** Map a Windows path to its WSL /mnt/<drive>/... mount (WSL2 default automount). */
+function toWslMount(winPath: string): string {
+  return winPath.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_m, d: string) => `/mnt/${d.toLowerCase()}`)
+}
+
+/** Run a short `wsl.exe -d <distro> -- bash -lc <cmd>` and await exit. */
+async function wslSh(ctx: { subprocess: { spawn(spec: unknown): any } }, distro: string, cmd: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    const handle = ctx.subprocess.spawn({
+      argv: ['wsl.exe', '-d', distro, '--', 'bash', '-lc', cmd],
+      cwd: process.cwd(),
+      stdio: { stdin: 'ignore' as const, stdout: { maxBytes: 4096 }, stderr: { maxBytes: 4096 } },
+      graceMs: 2000,
+      ...(signal ? { signal } : {}),
+    })
+    await handle.done
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Auto-deploy the daemon payload (~/.dshwsl/{exec-server.js,launch.sh,
+ * dshwsl-env.bash}) from the installed package's `daemon/` dir, so a fresh WSL
+ * needs NO manual copy step. Writes each file to a Windows temp then `cp`s it
+ * across through wsl.exe (avoids sending the file body through process argv).
+ * Idempotent: bash receives the bytes but the script runs unconditionally and
+ * simply overwrites the target; call it before (re)launching.
+ */
+async function deployDaemonPayload(ctx: { subprocess: { spawn(spec: unknown): any } }, distro: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    await wslSh(ctx, distro, 'mkdir -p "$HOME/.dshwsl"', signal)
+    for (const rel of DAEMON_PAYLOAD) {
+      const src = fileURLToPath(new URL(`../${rel}`, import.meta.url))
+      if (!existsSync(src)) continue // daemon/ not shipped in this install — skip
+      const tmp = join(tmpdir(), `dshwsl-${rel.replace(/[\\/]/g, '-')}`)
+      try { writeFileSync(tmp, readFileSync(src, 'utf8')) } catch { continue }
+      const ok = await wslSh(ctx, distro, `cp '${toWslMount(tmp)}' "$HOME/.dshwsl/${rel.split('/')[1]}"`, signal)
+      try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
+      if (!ok) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
 
 // Bash one-liner, spawn via `wsl.exe -d <distro> -- bash -lc <this>`.
 // Resolves a node by preference, cd's into ~/.dshwsl, and starts the
@@ -425,6 +480,7 @@ export function apply(_ctx: Context, config: {
             lastDaemonStart = now
             if (!daemonLaunching) {
               daemonLaunching = (async () => {
+                try { await deployDaemonPayload(ctx, distro, exec.signal) } catch {}
                 try { await launchDaemonViaWsl(ctx, distro, exec.signal, daemonToken) } catch {}
                 await sleep(DAEMON_START_WAIT_MS)
               })()
