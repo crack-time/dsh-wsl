@@ -113,6 +113,7 @@ function runViaDaemon(host: string, port: number, req: {
   workdir?: string
   env?: Record<string, string>
   timeoutMs: number
+  token?: string
 }): Promise<DaemonResult> {
   return new Promise((resolve, reject) => {
     const socket = connect({ host, port })
@@ -133,6 +134,7 @@ function runViaDaemon(host: string, port: number, req: {
         workdir: req.workdir,
         env: req.env,
         timeoutMs: req.timeoutMs,
+        ...(req.token ? { token: req.token } : {}),
       }) + '\n')
     })
     socket.on('data', (chunk: Buffer | string) => {
@@ -149,17 +151,22 @@ function runViaDaemon(host: string, port: number, req: {
         else if (f.channel === 'stderr') stderr += f.text ?? ''
         else if (f.done) {
           clearTimeout(idle)
-          settle(() => {
+          if (f.error === 'unauthorized') {
             socket.end()
-            resolve({
-              exitCode: f.exitCode ?? null,
-              signal: f.signal ?? null,
-              stdout,
-              stderr,
-              timedOut: f.error === 'timed out' || /timed out/.test(f.error ?? ''),
-              error: f.error,
+            settle(() => reject(new Error('wsl daemon refused the request (token mismatch)')))
+          } else {
+            settle(() => {
+              socket.end()
+              resolve({
+                exitCode: f.exitCode ?? null,
+                signal: f.signal ?? null,
+                stdout,
+                stderr,
+                timedOut: f.error === 'timed out' || /timed out/.test(f.error ?? ''),
+                error: f.error,
+              })
             })
-          })
+          }
         }
       }
     })
@@ -180,23 +187,27 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 // Bash one-liner, spawn via `wsl.exe -d <distro> -- bash -lc <this>`.
 // Resolves a node by preference, cd's into ~/.dshwsl, and starts the
-// exec-server detached (setsid nohup + </dev/null + disown). The trailing
-// `sleep 2` keeps the parent bash alive long enough for setsid to fully
-// detach so the process survives the wsl.exe client exiting — without it the
-// daemon is reaped on exit. `$VAR` stays literal for bash (JS only expands
-// `${`). Mirrors daemon/launch.sh so the tool is self-sufficient without it.
-const DAEMON_LAUNCH_BASH = [
-  'cd "$HOME/.dshwsl" 2>/dev/null || { echo "dsh-wsl: ~/.dshwsl missing" >&2; exit 2; }',
-  'if command -v node >/dev/null 2>&1; then NODE="$(command -v node)"; elif [ -x /home/linuxbrew/.linuxbrew/bin/node ]; then NODE="/home/linuxbrew/.linuxbrew/bin/node"; elif [ -x "$HOME/.zcode/server/node" ]; then NODE="$HOME/.zcode/server/node"; else echo "dsh-wsl: no node in WSL" >&2; exit 3; fi',
-  '[ -f exec-server.js ] || { echo "dsh-wsl: daemon payload missing (run daemon/launch.sh once)" >&2; exit 4; }',
-  'setsid nohup "$NODE" exec-server.js > exec.log 2>&1 < /dev/null & disown 2>/dev/null || true',
-  'sleep 2',
-].join('; ')
+// exec-server detached (setsid nohup + </dev/null + disown) with an optional
+// shared secret. The trailing `sleep 2` keeps the parent bash alive long
+// enough for setsid to fully detach so the process survives the wsl.exe client
+// exiting — without it the daemon is reaped on exit. `$VAR` stays literal for
+// bash (JS only expands `${`). Mirrors daemon/launch.sh so the tool is
+// self-sufficient without it.
+function daemonLaunchBash(token?: string): string {
+  const tokenAssign = token ? `DSHWSL_TOKEN=${shellQuote(token)} ` : ''
+  return [
+    'cd "$HOME/.dshwsl" 2>/dev/null || { echo "dsh-wsl: ~/.dshwsl missing" >&2; exit 2; }',
+    'if command -v node >/dev/null 2>&1; then NODE="$(command -v node)"; elif [ -x /home/linuxbrew/.linuxbrew/bin/node ]; then NODE="/home/linuxbrew/.linuxbrew/bin/node"; elif [ -x "$HOME/.zcode/server/node" ]; then NODE="$HOME/.zcode/server/node"; else echo "dsh-wsl: no node in WSL" >&2; exit 3; fi',
+    '[ -f exec-server.js ] || { echo "dsh-wsl: daemon payload missing (run daemon/launch.sh once)" >&2; exit 4; }',
+    `${tokenAssign}setsid nohup "$NODE" exec-server.js > exec.log 2>&1 < /dev/null & disown 2>/dev/null || true`,
+    'sleep 2',
+  ].join('; ')
+}
 
-async function launchDaemonViaWsl(ctx: { subprocess: { spawn(spec: unknown): any } }, distro: string, signal?: AbortSignal): Promise<boolean> {
+async function launchDaemonViaWsl(ctx: { subprocess: { spawn(spec: unknown): any } }, distro: string, signal?: AbortSignal, token?: string): Promise<boolean> {
   try {
     const handle = ctx.subprocess.spawn({
-      argv: ['wsl.exe', '-d', distro, '--', 'bash', '-lc', DAEMON_LAUNCH_BASH],
+      argv: ['wsl.exe', '-d', distro, '--', 'bash', '-lc', daemonLaunchBash(token)],
       cwd: process.cwd(),
       stdio: {
         stdin: 'ignore' as const,
@@ -305,7 +316,7 @@ export function apply(_ctx: Context, config: {
   /** 'bridge' (default) spawns wsl.exe per call; 'daemon' sends commands to a resident WSL exec-server. */
   runtime?: 'bridge' | 'daemon'
   /** Connection target when runtime === 'daemon'. host/port default to the localhost-forwarded WSL2 target. */
-  daemon?: { host?: string; port?: number; autoStart?: boolean }
+  daemon?: { host?: string; port?: number; autoStart?: boolean; token?: string }
 } = {}): void {
   const ctx = _ctx as unknown as {
     systemPrompt: { section(o: unknown): void; getSectionOrder(n: string): number }
@@ -322,6 +333,9 @@ export function apply(_ctx: Context, config: {
   const daemonEnabled = config.runtime !== 'bridge'
   const daemonHost = config.daemon?.host ?? '127.0.0.1'
   const daemonPort = config.daemon?.port ?? 37778
+  // Optional shared secret; when set, sent to the exec-server and injected into
+  // the auto-launched daemon's env (daemon refuses requests without a match).
+  const daemonToken = config.daemon?.token
   // On first unreachable call, self-launch the daemon via wsl.exe (then retry
   // once) instead of only falling back to the bridge. Default on.
   const daemonAutoStart = config.daemon?.autoStart ?? true
@@ -422,6 +436,7 @@ export function apply(_ctx: Context, config: {
           workdir: args.workdir !== void 0 ? linuxPath : undefined,
           env: dshEnv,
           timeoutMs,
+          token: daemonToken,
         }
         try {
           // Per-workspace persistent shell: key by the workspace's Linux path,
@@ -446,7 +461,7 @@ export function apply(_ctx: Context, config: {
             lastDaemonStart = now
             if (!daemonLaunching) {
               daemonLaunching = (async () => {
-                try { await launchDaemonViaWsl(ctx, distro, exec.signal) } catch {}
+                try { await launchDaemonViaWsl(ctx, distro, exec.signal, daemonToken) } catch {}
                 await sleep(DAEMON_START_WAIT_MS)
               })()
               daemonLaunching.catch(() => {}).finally(() => { daemonLaunching = null })

@@ -14,6 +14,7 @@
 const net = require('node:net');
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.DSHWSL_EXEC_PORT || 37778);
+const TOKEN = process.env.DSHWSL_TOKEN;
 
 function command(req) {
   return new Promise((resolve, reject) => {
@@ -34,7 +35,7 @@ function command(req) {
         else if (f.done) { clearTimeout(t); socket.end(); out.done = f; resolve(out); }
       }
     });
-    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, session: req.session, initWorkdir: req.initWorkdir, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs }) + '\n');
+    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, session: req.session, initWorkdir: req.initWorkdir, workdir: req.workdir, env: req.env, timeoutMs: req.timeoutMs, token: req.token ?? TOKEN }) + '\n');
     const wait = req.timeoutMs && req.timeoutMs > 0 ? req.timeoutMs : 30000;
     const t = setTimeout(() => { socket.destroy(); reject(new Error('reply timeout')); }, wait + 8000);
   });

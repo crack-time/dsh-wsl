@@ -14,6 +14,8 @@ const net = require('node:net');
 
 const HOST = process.env.DSHWSL_EXEC_HOST || '127.0.0.1';
 const PORT = Number(process.env.DSHWSL_EXEC_PORT || 37778);
+// Optional shared secret; set when the daemon runs with a token.
+const TOKEN = process.env.DSHWSL_TOKEN;
 
 function sendCommand(socket, req) {
   return new Promise((resolve, reject) => {
@@ -39,7 +41,7 @@ function sendCommand(socket, req) {
       }
     };
     socket.on('data', onData);
-    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, workdir: req.workdir, env: req.env }) + '\n');
+    socket.write(JSON.stringify({ id: req.id, cmd: req.cmd, workdir: req.workdir, env: req.env, token: req.token ?? TOKEN }) + '\n');
     const wait = Number.isFinite(req.timeoutMs) && req.timeoutMs > 0 ? req.timeoutMs : 30000;
     setTimeout(() => { socket.off('data', onData); reject(new Error('timeout waiting reply')); }, wait + 5000).unref();
   });

@@ -11,5 +11,6 @@ export declare function apply(_ctx: Context, config?: {
         host?: string;
         port?: number;
         autoStart?: boolean;
+        token?: string;
     };
 }): void;

@@ -51,6 +51,12 @@ const { join } = require('node:path');
 
 const PORT = Number(process.env.DSHWSL_EXEC_PORT || 37778);
 const BASH = process.env.DSHWSL_BASH || '/bin/bash';
+// Optional shared secret. When set, every request must carry an equal `token`;
+// requests without a matching token are refused (still-reachable others get an
+// error frame). Unset (default) = no authentication (localhost-only trust, as
+// before). The tool / auto-launch pass DSHWSL_TOKEN so a configured daemon and
+// its clients share the same secret.
+const TOKEN = process.env.DSHWSL_TOKEN || null;
 // BASH_ENV bootstrap that reproduces ~/.bashrc's exported env for the
 // daemon's non-interactive persistent bash (see daemon/dshwsl-env.bash).
 const ENV_BASH_FILE = process.env.HOME ? join(process.env.HOME, '.dshwsl', 'dshwsl-env.bash') : null;
@@ -250,6 +256,10 @@ const server = net.createServer((socket) => {
       if (!line) continue;
       let obj;
       try { obj = JSON.parse(line); } catch { send({ id: null, error: 'bad json' }); continue; }
+      if (TOKEN && obj.token !== TOKEN) {
+        send({ id: obj.id ?? null, done: true, exitCode: null, signal: null, error: 'unauthorized' });
+        continue;
+      }
       if (typeof obj.cmd !== 'string' || obj.cmd.length === 0) {
         send({ id: obj.id ?? null, done: true, exitCode: null, error: 'empty cmd' });
         continue;
