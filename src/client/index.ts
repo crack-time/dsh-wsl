@@ -1,13 +1,14 @@
 /**
  * Client entry for the WSL workspace browser.
  *
- * The native sidebar "Add workspace" button becomes a single split action:
- * its click is intercepted in the document CAPTURE phase (before React's
- * root-container listener can open the native picker) and a two-item menu is
- * shown —「Windows 工作区」replays the click through a one-shot passthrough so
- * the native directory flow opens exactly as usual, 「WSL 工作区」opens this
- * plugin's WSL browser. No second button is added; the header keeps the native
- * look.
+ * The native sidebar "Add workspace" button is replaced (in place, same native
+ * look) by an identical-look button that belongs to this plugin. Clicking it
+ * shows a two-item menu —「Windows 工作区」programmatically clicks the hidden
+ * native button so React's own directory flow opens exactly as usual,
+ * 「WSL 工作区」opens this plugin's WSL browser. Because the visible button has
+ * no React fiber and carries only this plugin's click handler, React's event
+ * delegation can never hijack the click (the earlier intercept-inside-a-button
+ * approach did not fire before React's root listener on this skin).
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import { createElement } from 'react'
@@ -94,54 +95,83 @@ function showMenu(anchor: HTMLElement, onWindows: () => void, onWsl: () => void)
   menuCleanup = cleanup
 }
 
-/**
- * Intercept a click on the native Add-workspace button in the document
- * CAPTURE phase so it runs before React's container listener. Returns the
- * button element when the click should be swallowed (menu shown), else null.
- */
-function interceptAddButton(e: Event, passthrough: () => boolean): HTMLButtonElement | null {
-  const t = e.target
-  if (!(t instanceof Element)) return null
-  const btn = t.closest<HTMLButtonElement>('button[aria-label]')
-  if (!btn) return null
-  const label = (btn.getAttribute('aria-label') || '').trim()
-  if (!NATIVE_ADD_LABELS.includes(label)) return null
-  if (passthrough()) return null // one-shot replay → let React handle it
-  e.preventDefault()
-  e.stopPropagation()
-  e.stopImmediatePropagation()
-  return btn
+// ---------------------------------------------------------------------------
+// Replace the native add button with our identical-look button
+// ---------------------------------------------------------------------------
+function findNativeAddButton(): HTMLButtonElement | null {
+  for (const btn of document.querySelectorAll<HTMLButtonElement>('button[aria-label]')) {
+    const label = (btn.getAttribute('aria-label') || '').trim()
+    if (NATIVE_ADD_LABELS.includes(label)) return btn
+  }
+  return null
 }
 
-export function apply(ctx: ClientContext): void {
-  injectWslCss()
+function ensureButton(): void {
+  const native = findNativeAddButton()
+  if (!native) return
+  // Already swapped and still has our button next to it → leave stable.
+  if (native.dataset.dshwslSwapped === '1') {
+    if (document.querySelector('[data-dshwsl-add-btn]')) return
+    // fallthrough: clone was removed → rebuild below
+  }
 
-  // One-shot passthrough for the "Windows 工作区" replay click.
-  let passthrough = false
+  // Drop any stale clones from earlier runs, then hide the native and seat ours.
+  document.querySelectorAll('[data-dshwsl-add-btn]').forEach((el) => el.remove())
 
-  const onCaptureClick = (e: Event): void => {
-    const btn = interceptAddButton(e, () => passthrough)
-    if (!btn) return
+  native.dataset.dshwslSwapped = '1'
+  native.style.display = 'none'
+
+  const b = native.cloneNode(true) as HTMLButtonElement
+  if (b.id) b.id = ''
+  b.querySelectorAll<HTMLElement>('[id]').forEach((el) => el.removeAttribute('id'))
+  b.dataset.dshwslAddBtn = ''
+  b.removeAttribute('aria-pressed')
+  b.title = 'WSL 工作区'
+  b.addEventListener('click', (e) => {
+    e.preventDefault()
+    e.stopPropagation()
     showMenu(
-      btn,
-      () => { passthrough = true; btn.click() },
+      b,
+      () => { native.click() }, // Windows → native flow via the hidden button
       () => {
         browserCleanup?.()
         browserCleanup = mountBrowser()
       },
     )
-  }
+  })
+  native.insertAdjacentElement('afterend', b)
+}
 
-  document.addEventListener('click', onCaptureClick, true)
+export function apply(ctx: ClientContext): void {
+  injectWslCss()
+  ensureButton()
+
+  let scheduled = false
+  const schedule = (): void => {
+    if (scheduled) return
+    scheduled = true
+    requestAnimationFrame(() => {
+      scheduled = false
+      ensureButton()
+    })
+  }
+  const observer = new MutationObserver(schedule)
+  observer.observe(document.body, { childList: true, subtree: true })
 
   try {
     ctx.effect(() => () => {
-      document.removeEventListener('click', onCaptureClick, true)
+      observer.disconnect()
       closeMenu()
       browserCleanup?.()
       browserCleanup = null
+      // Un-hide the native button and drop our clone on teardown.
+      document.querySelectorAll('[data-dshwsl-add-btn]').forEach((el) => el.remove())
+      document.querySelectorAll('[data-dshwsl-swapped]').forEach((el) => {
+        ;(el as HTMLElement).style.display = ''
+        el.removeAttribute('data-dshwsl-swapped')
+      })
     }, 'dsh-wsl: workspace browser')
   } catch {
-    /* effect unavailable; capture listener survives module teardown */
+    /* effect unavailable; DOM entries survive module teardown */
   }
 }
