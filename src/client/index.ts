@@ -2,16 +2,12 @@
  * Client entry for the WSL workspace browser.
  *
  * The native sidebar "Add workspace" button becomes a single split action:
- * clicking it opens a two-item menu —「Windows 工作区」runs the native directory
- * flow, 「WSL 工作区」opens this plugin's WSL browser (pick a distro, walk the
- * Linux filesystem, register a directory as a native workspace). No second
- * button is added, so the header keeps the native look.
- *
- * Interception: a bubble-phase listener on the native button prevents the
- * suppressed React onClick from opening the native picker immediately; the
- * "Windows" choice re-fires a synthetic click that is allowed through a
- * one-shot passthrough flag, so the native flow opens exactly as if the button
- * had been clicked directly.
+ * its click is intercepted in the document CAPTURE phase (before React's
+ * root-container listener can open the native picker) and a two-item menu is
+ * shown —「Windows 工作区」replays the click through a one-shot passthrough so
+ * the native directory flow opens exactly as usual, 「WSL 工作区」opens this
+ * plugin's WSL browser. No second button is added; the header keeps the native
+ * look.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import { createElement } from 'react'
@@ -27,7 +23,7 @@ const NATIVE_ADD_LABELS = ['添加工作区', 'Add workspace', 'Add workspace…
 // ---------------------------------------------------------------------------
 // WSL workspace browser (React modal)
 // ---------------------------------------------------------------------------
-function mountBrowser(onRegistered: (w: { workspaceId: string; path: string; title: string }) => void): () => void {
+function mountBrowser(): () => void {
   const host = document.createElement('div')
   host.dataset.dshwslBrowser = ''
   document.body.appendChild(host)
@@ -41,16 +37,13 @@ function mountBrowser(onRegistered: (w: { workspaceId: string; path: string; tit
     host.remove()
   }
   root = createRoot(host)
-  root.render(createElement(WslBrowser, { onClose: cleanup, onRegistered }))
+  root.render(createElement(WslBrowser, { onClose: cleanup }))
   return cleanup
 }
 
 let browserCleanup: (() => void) | null = null
 let menuCleanup: (() => void) | null = null
 
-// ---------------------------------------------------------------------------
-// Two-option menu (plain DOM, native-aligned styling from wsl-css.ts)
-// ---------------------------------------------------------------------------
 function closeMenu(): void {
   menuCleanup?.()
   menuCleanup = null
@@ -93,85 +86,62 @@ function showMenu(anchor: HTMLElement, onWindows: () => void, onWsl: () => void)
     host.remove()
     backdrop.remove()
     document.removeEventListener('keydown', onKey)
-    menuCleanup = null
   }
-  backdrop.addEventListener('click', cleanup)
+  backdrop.addEventListener('click', () => closeMenu())
   document.addEventListener('keydown', onKey)
   document.body.appendChild(backdrop)
   document.body.appendChild(host)
   menuCleanup = cleanup
 }
 
-// ---------------------------------------------------------------------------
-// Wire the single native add button
-// ---------------------------------------------------------------------------
-function findNativeAddButton(): HTMLButtonElement | null {
-  for (const btn of document.querySelectorAll<HTMLButtonElement>('button[aria-label]')) {
-    const label = (btn.getAttribute('aria-label') || '').trim()
-    if (NATIVE_ADD_LABELS.includes(label)) return btn
-  }
-  return null
+/**
+ * Intercept a click on the native Add-workspace button in the document
+ * CAPTURE phase so it runs before React's container listener. Returns the
+ * button element when the click should be swallowed (menu shown), else null.
+ */
+function interceptAddButton(e: Event, passthrough: () => boolean): HTMLButtonElement | null {
+  const t = e.target
+  if (!(t instanceof Element)) return null
+  const btn = t.closest<HTMLButtonElement>('button[aria-label]')
+  if (!btn) return null
+  const label = (btn.getAttribute('aria-label') || '').trim()
+  if (!NATIVE_ADD_LABELS.includes(label)) return null
+  if (passthrough()) return null // one-shot replay → let React handle it
+  e.preventDefault()
+  e.stopPropagation()
+  e.stopImmediatePropagation()
+  return btn
 }
 
 export function apply(ctx: ClientContext): void {
   injectWslCss()
 
-  // One-shot passthrough: when set, the next click on the native button is NOT
-  // swallowed — it propagates to React so the native directory flow opens.
+  // One-shot passthrough for the "Windows 工作区" replay click.
   let passthrough = false
 
-  function ensureWiring(): void {
-    const btn = findNativeAddButton()
-    if (!btn || btn.hasAttribute('data-dshwsl-wired')) return
-    btn.setAttribute('data-dshwsl-wired', 'true')
-
-    btn.addEventListener('click', (e) => {
-      if (passthrough) {
-        passthrough = false
-        return // let this synthetic click reach React → native flow
-      }
-      e.preventDefault()
-      e.stopPropagation() // suppress React's onClick (native picker stays closed)
-      const native = btn
-      showMenu(
-        native,
-        // "Windows 工作区": re-fire a click that propagates to React.
-        () => { passthrough = true; native.click() },
-        // "WSL 工作区": open this plugin's WSL browser.
-        () => {
-          browserCleanup?.()
-          browserCleanup = mountBrowser(() => {
-            browserCleanup = null
-          })
-        },
-      )
-    })
+  const onCaptureClick = (e: Event): void => {
+    const btn = interceptAddButton(e, () => passthrough)
+    if (!btn) return
+    showMenu(
+      btn,
+      () => { passthrough = true; btn.click() },
+      () => {
+        browserCleanup?.()
+        browserCleanup = mountBrowser()
+      },
+    )
   }
 
-  ensureWiring()
-
-  let scheduled = false
-  const schedule = (): void => {
-    if (scheduled) return
-    scheduled = true
-    requestAnimationFrame(() => {
-      scheduled = false
-      ensureWiring()
-    })
-  }
-  const observer = new MutationObserver(schedule)
-  observer.observe(document.body, { childList: true, subtree: true })
+  document.addEventListener('click', onCaptureClick, true)
 
   try {
     ctx.effect(() => () => {
-      observer.disconnect()
+      document.removeEventListener('click', onCaptureClick, true)
       closeMenu()
       browserCleanup?.()
       browserCleanup = null
-      // Drop our wiring marker so a fresh module pass re-wires the button.
-      document.querySelectorAll('[data-dshwsl-wired]').forEach((el) => el.removeAttribute('data-dshwsl-wired'))
     }, 'dsh-wsl: workspace browser')
   } catch {
-    /* effect unavailable; DOM entries survive module teardown */
+    /* effect unavailable; capture listener survives module teardown */
   }
 }
