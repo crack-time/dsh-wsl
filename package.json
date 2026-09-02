@@ -30,7 +30,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
-    "test:util": "node test/wsl-util.test.mjs"
+    "test:util": "node test/wsl-util.test.mjs",
+    "install:preset": "node scripts/sync-from-standard.mjs"
   },
   "license": "MIT",
   "files": [
