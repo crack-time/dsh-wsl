@@ -1,11 +1,17 @@
 /**
  * Client entry for the WSL workspace browser.
  *
- * Injects a "＋ WSL 工作区" button right after the native Add-workspace button
- * in the sidebar (DOM-injected like dsh-archive: the native workspace list has
- * no public slot contract for sibling header actions, so we seat next to the
- * found button). Clicking it mounts the WSL browser as a modal overlay via
- * React createRoot; style + shell are self-contained.
+ * The native sidebar "Add workspace" button becomes a single split action:
+ * clicking it opens a two-item menu —「Windows 工作区」runs the native directory
+ * flow, 「WSL 工作区」opens this plugin's WSL browser (pick a distro, walk the
+ * Linux filesystem, register a directory as a native workspace). No second
+ * button is added, so the header keeps the native look.
+ *
+ * Interception: a bubble-phase listener on the native button prevents the
+ * suppressed React onClick from opening the native picker immediately; the
+ * "Windows" choice re-fires a synthetic click that is allowed through a
+ * one-shot passthrough flag, so the native flow opens exactly as if the button
+ * had been clicked directly.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis';
 /** No client services are injected: this client is pure-DOM + fetch. */
