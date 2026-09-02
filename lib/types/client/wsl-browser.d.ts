@@ -1,3 +1,4 @@
+import { type LocaleRuntime } from './wsl-locale.ts';
 export interface WslBrowserProps {
     onClose: () => void;
     /**
@@ -10,5 +11,7 @@ export interface WslBrowserProps {
         title: string;
     }) => void;
     errorMessage?: string;
+    /** DSH client locale runtime, for automatic zh/en switching. */
+    locale?: LocaleRuntime;
 }
-export declare function WslBrowser({ onClose, onRegistered }: WslBrowserProps): import("react").JSX.Element;
+export declare function WslBrowser({ onClose, onRegistered, locale }: WslBrowserProps): import("react").JSX.Element;

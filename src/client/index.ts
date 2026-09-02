@@ -14,16 +14,23 @@ import { createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { WslBrowser } from './wsl-browser.tsx'
 import { injectWslCss } from './wsl-css.ts'
+import { DICT, WSL_LOCALE, type LocaleRuntime } from './wsl-locale.ts'
 
-/** No client services are injected: this client is pure-DOM + fetch. */
-export const inject: string[] = []
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    locale?: LocaleRuntime
+  }
+}
+
+/** Injects the DSH locale service so the menu/dialog follow the active language. */
+export const inject: string[] = ['locale']
 
 const NATIVE_ADD_LABELS = ['添加工作区', 'Add workspace', 'Add workspace…', 'Add workspace', 'Add Workspace']
 
 // ---------------------------------------------------------------------------
 // WSL workspace browser (React modal)
 // ---------------------------------------------------------------------------
-function mountBrowser(): () => void {
+function mountBrowser(locale?: LocaleRuntime): () => void {
   const host = document.createElement('div')
   host.dataset.dshwslBrowser = ''
   document.body.appendChild(host)
@@ -37,7 +44,7 @@ function mountBrowser(): () => void {
     host.remove()
   }
   root = createRoot(host)
-  root.render(createElement(WslBrowser, { onClose: cleanup }))
+  root.render(createElement(WslBrowser, { onClose: cleanup, locale }))
   return cleanup
 }
 
@@ -49,7 +56,7 @@ function closeMenu(): void {
   menuCleanup = null
 }
 
-function showMenu(anchor: HTMLElement, onWindows: () => void, onWsl: () => void): void {
+function showMenu(anchor: HTMLElement, t: (key: string) => string, onWindows: () => void, onWsl: () => void): void {
   closeMenu()
   const rect = anchor.getBoundingClientRect()
 
@@ -77,8 +84,10 @@ function showMenu(anchor: HTMLElement, onWindows: () => void, onWsl: () => void)
     return b
   }
 
-  menu.appendChild(item('Windows 工作区', onWindows))
-  menu.appendChild(item('WSL 工作区', onWsl))
+  // `t` reads the active locale at call time, so the menu matches the current
+  // language (it is rebuilt on every open).
+  menu.appendChild(item(t('menuWindows'), onWindows))
+  menu.appendChild(item(t('menuWsl'), onWsl))
   host.appendChild(menu)
 
   const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') closeMenu() }
@@ -116,6 +125,11 @@ function interceptAddButton(e: Event, passthrough: () => boolean): HTMLButtonEle
 export function apply(ctx: ClientContext): void {
   injectWslCss()
 
+  // Register the bilingual dict and bind a translate fn that reads the active
+  // DSH locale at call time (auto-follows zh/en switches). Nullish-safe fallback.
+  ctx.locale?.register?.(DICT, WSL_LOCALE)
+  const t: (key: string) => string = ctx.locale?.bind?.(DICT) ?? ((key: string) => key)
+
   // One-shot passthrough for the "Windows 工作区" replay click.
   let passthrough = false
 
@@ -124,6 +138,7 @@ export function apply(ctx: ClientContext): void {
     if (!btn) return
     showMenu(
       btn,
+      t,
       () => {
         passthrough = true
         btn.click()
@@ -135,7 +150,7 @@ export function apply(ctx: ClientContext): void {
       },
       () => {
         browserCleanup?.()
-        browserCleanup = mountBrowser()
+        browserCleanup = mountBrowser(ctx.locale)
       },
     )
   }

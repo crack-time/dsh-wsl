@@ -10,6 +10,12 @@
  * the click falls through to the native flow, so the button never breaks.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis';
-/** No client services are injected: this client is pure-DOM + fetch. */
+import { type LocaleRuntime } from './wsl-locale.ts';
+declare module '@deepseek-ai/cordis' {
+    interface Context {
+        locale?: LocaleRuntime;
+    }
+}
+/** Injects the DSH locale service so the menu/dialog follow the active language. */
 export declare const inject: string[];
 export declare function apply(ctx: ClientContext): void;
