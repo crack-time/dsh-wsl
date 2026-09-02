@@ -62,7 +62,7 @@ The `daemon/` directory ships the P0 implementation:
 |---|---|
 | `daemon/exec-server.js` | resident bash execution machine (zero-dependency Node; the launcher resolves the Node binary — linuxbrew preferred, `~/.zcode/server/node` fallback) |
 | `daemon/launch.sh` | detach + revive helper; resolves Node by preference (`node` on PATH → linuxbrew `~/.linuxbrew/bin/node` → bundled `~/.zcode/server/node` fallback), `setsid nohup`, writes `daemon.pid` |
-| `daemon/dshwsl-env.bash` | BASH_ENV bootstrap for the persistent bash: reproduces `~/.bashrc`'s exported env (linuxbrew, conda, cuda/lammps PATH) bypassing its non-interactive guard, so brew/node/npm/conda are callable from `wsl` commands |
+| `daemon/dshwsl-env.bash` | env bootstrap reproducing `~/.bashrc`'s exported env (linuxbrew, conda, cuda/lammps PATH) bypassing its non-interactive guard. Loaded via BASH_ENV by the daemon's persistent bash **and** sourced at the top of each one-shot bridge command, so brew/node/npm/conda are callable from `wsl` commands in **both** runtimes |
 | `daemon/client.cjs` | Windows-side test client (`node daemon/client.cjs`) |
 
 The daemon listens on `127.0.0.1:37778`; Windows reaches it through WSL2's

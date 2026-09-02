@@ -288,6 +288,14 @@ function buildScript(modelFriendlyEnv: Record<string, string>): string {
   return lines.join('\n')
 }
 
+// Bridge-mode env bootstrap. `wsl.exe --exec bash -lc` is non-interactive, so
+// it never reads ~/.bashrc and brew/conda/cuda/lammps are off PATH — uv/conda
+// report "not found" for one-shot commands. Source the SAME dshwsl-env.bash the
+// daemon's persistent bash loads via BASH_ENV, so bridge and daemon expose the
+// identical environment (uv/conda/brew/node reachable in both). Best-effort:
+// skipped when the file is absent (fresh clone / not yet deployed).
+const BRIDGE_ENV_BOOT = '[ -r "$HOME/.dshwsl/dshwsl-env.bash" ] && . "$HOME/.dshwsl/dshwsl-env.bash" || true'
+
 // ---------------------------------------------------------------------------
 // The tool plugin
 // ---------------------------------------------------------------------------
@@ -392,7 +400,7 @@ export function apply(_ctx: Context, config: {
       const distro = distroOf(workdir, configuredDistro)
       const linuxPath = toWslPath(workdir ?? '')
       const dshEnv = ctx.shellEnv.collect(exec) as Record<string, string>
-      const script = buildScript(dshEnv)
+      const script = [BRIDGE_ENV_BOOT, buildScript(dshEnv)].filter(Boolean).join('\n')
       const argv = wslArgv(distro, linuxPath, script, args.command)
 
       const timeoutMs = clampTimeout(args.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, 'request.timeoutMs')
