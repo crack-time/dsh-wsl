@@ -3,3 +3,7 @@ node_modules
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# pnpm artifacts (repo tracks the npm lockfile)
+pnpm-lock.yaml
+pnpm-workspace.yaml
