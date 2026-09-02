@@ -1,0 +1,36 @@
+{
+  "name": "@crack/dsh-wsl",
+  "description": "Host plugin that turns the shell capability seam (ctx.shell) into a WSL remote executor: the model's bash tool runs inside a WSL distro (ZCode-remote-connection style), with Windows workdir → /mnt/... translation and env re-export, while the DSH host keeps running natively on Windows.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check:local": "node test/selfcheck.mjs",
+    "test": "node test/run.mjs"
+  },
+  "license": "MIT",
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}
