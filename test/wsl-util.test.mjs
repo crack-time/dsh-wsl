@@ -115,5 +115,13 @@ ok('uses replace() with replace_all', () => assert.match(
   editFileCmd('/tmp/a.txt', 'b2xk', 'bmV3', true),
   /s=s\.replace\(old,new\)/,
 ))
+ok('emits Python False (not JS false) for single-match', () => assert.match(
+  editFileCmd('/tmp/a.txt', 'b2xk', 'bmV3', false),
+  /if not False and cnt!=1:/,
+))
+ok('emits Python True for replace_all', () => assert.match(
+  editFileCmd('/tmp/a.txt', 'b2xk', 'bmV3', true),
+  /if not True and cnt!=1:/,
+))
 
 console.log(`\n${passed} assertions passed`)
