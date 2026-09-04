@@ -809,7 +809,7 @@ export function apply(_ctx: Context, config: {
       return { text }
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
       render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
     },
   } as never))
@@ -829,7 +829,7 @@ export function apply(_ctx: Context, config: {
       return { text }
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
       render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
     },
   } as never))
