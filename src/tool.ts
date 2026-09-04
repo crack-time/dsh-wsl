@@ -47,6 +47,8 @@ import {
   writeFileCmd,
   resolveWorkdir,
   shellQuote,
+  workspaceWriteGuard,
+  assertWslPathInside,
   DEFAULT_DISTRO,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
@@ -501,6 +503,27 @@ function presentResult(args: { run_in_background?: boolean }, result: { content:
 // skipped when the file is absent (fresh clone / not yet deployed).
 const BRIDGE_ENV_BOOT = '[ -r "$HOME/.dshwsl/dshwsl-env.bash" ] && . "$HOME/.dshwsl/dshwsl-env.bash" || true'
 
+// Sandbox-mode read (mirrors tool-fs: `ctx.get("sandboxPolicy").resolve({ session })`).
+// Returns 'danger-full-access' when the policy service is unavailable or unreadable,
+// so the tool never blocks on a missing dependency. On WSL, read-only is effectively
+// workspace-write, so confinement kicks in whenever the mode is NOT danger-full-access.
+type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+function resolveSandboxMode(ctx: { get(n: string): unknown }, exec: { agent?: { session: unknown } }): SandboxMode {
+  try {
+    const policy = ctx.get('sandboxPolicy') as { resolve?(request?: { session?: unknown }): { mode?: string } | void } | undefined
+    const req = exec.agent ? { session: exec.agent.session } : void 0
+    const mode = policy?.resolve?.(req)?.mode
+    if (mode === 'read-only' || mode === 'workspace-write' || mode === 'danger-full-access') return mode
+    return 'danger-full-access'
+  } catch {
+    return 'danger-full-access'
+  }
+}
+/** When the device surface is writable within the workspace (everything but danger). */
+function confining(mode: SandboxMode): boolean {
+  return mode !== 'danger-full-access'
+}
+
 // ---------------------------------------------------------------------------
 // The tool plugin
 // ---------------------------------------------------------------------------
@@ -552,7 +575,10 @@ export function apply(_ctx: Context, config: {
     text: 'Check the [exit code: N] marker on every wsl result; investigate failures before moving on. ' +
       'This session runs on a WSL workspace: the native file tools (read, write, edit, glob, grep) are DISABLED here. ' +
       'Use the WSL-native tools instead — `wsl_read` (read), `wsl_grep` (search), `wsl_glob` (list), `wsl_write` (write), ' +
-      '`wsl_edit` (edit) — or run arbitrary shell commands with `wsl`.',
+      '`wsl_edit` (edit) — or run arbitrary shell commands with `wsl`. ' +
+      'This session sandbox constrains WSL writes to the workspace root: `wsl_write`/`wsl_edit` refuse targets outside it, and ' +
+      'the `wsl` shell mutating commands (rm/mv/mkdir/touch/truncate/ln/cp dest) are shadowed to reject writes outside it. ' +
+      'When danger-full-access applies, no restriction is injected.',
   })
 
   ctx.tools.register(defineTool({
@@ -614,8 +640,14 @@ export function apply(_ctx: Context, config: {
       const distro = distroOf(workdir, configuredDistro)
       const linuxPath = toWslPath(workdir ?? '')
       const dshEnv = ctx.shellEnv.collect(exec) as Record<string, string>
+      // Sandbox read: on WSL read-only ≈ workspace-write, so confine whenever mode is
+      // not danger-full-access. workspaceRoot here = the session workspace (its Linux path).
+      const mode = resolveSandboxMode(ctx, exec)
+      const workspaceRoot = toWslPath(sessionCwd ?? '')
+      const guard = confining(mode) ? workspaceWriteGuard(workspaceRoot) : ''
+      const command = guard ? `${guard}\n${args.command}` : args.command
       const script = [BRIDGE_ENV_BOOT, buildScript(dshEnv)].filter(Boolean).join('\n')
-      const argv = wslArgv(distro, linuxPath, script, args.command)
+      const argv = wslArgv(distro, linuxPath, script, command)
 
       const timeoutMs = clampTimeout(args.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, 'request.timeoutMs')
 
@@ -624,7 +656,7 @@ export function apply(_ctx: Context, config: {
       let daemonFallbackNote: string | undefined
       if (daemonEnabled && args.run_in_background !== true) {
         const outcome = await runDaemonForegroundBackend({
-          ctx, exec, distro, linuxPath, args, dshEnv, timeoutMs,
+          ctx, exec, distro, linuxPath, args: { ...args, command }, dshEnv, timeoutMs,
           daemonHost, daemonPort, daemonToken, daemonAutoStart,
         })
         if ('value' in outcome) return outcome.value
@@ -661,7 +693,7 @@ export function apply(_ctx: Context, config: {
         // (detached bash) so persistence semantics apply here too; else bridge.
         if (daemonEnabled) {
           const dJobId = await startDaemonBackground(daemonHost, daemonPort, daemonToken, {
-            cmd: args.command,
+            cmd: command,
             session: linuxPath || '/',
             initWorkdir: linuxPath || '/',
             workdir: args.workdir !== void 0 ? linuxPath : undefined,
@@ -743,11 +775,20 @@ export function apply(_ctx: Context, config: {
   // ── Structured file sub-tools ────────────────────────────────────────────
   // Execute one computed bash command through the same daemon-first backend,
   // returning the rendered foreground text (or the bridge fallback note).
-  async function execWslText(exec: { signal: AbortSignal }, command: string, workdirArg?: string, envArg?: Record<string, string | undefined>): Promise<string> {
+  async function execWslText(exec: { signal: AbortSignal; agent?: { session: { header: { cwd?: string } } } }, command: string, workdirArg?: string, envArg?: Record<string, string | undefined>, mutation?: { file: string; op: string }): Promise<string> {
     const sessionCwd = (exec as { agent?: { session: { header: { cwd?: string } } } }).agent?.session?.header?.cwd
     const workdir = resolveWorkdir(workdirArg, sessionCwd)
     const distro = distroOf(workdir, configuredDistro)
     const linuxPath = toWslPath(workdir ?? '')
+    // Sandbox: on WSL read-only ≈ workspace-write, so any mode other than
+    // danger-full-access confines writes to the session workspace root.
+    const mode = resolveSandboxMode(ctx, exec)
+    const workspaceRoot = toWslPath(sessionCwd ?? '')
+    if (confining(mode) && mutation) {
+      assertWslPathInside(workspaceRoot, mutation.file, mutation.op)
+    }
+    const guard = confining(mode) ? workspaceWriteGuard(workspaceRoot) : ''
+    const guardedCommand = guard ? `${guard}\n${command}` : command
     let dshEnv = ctx.shellEnv.collect(exec) as Record<string, string>
     if (envArg) {
       for (const [k, v] of Object.entries(envArg)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
@@ -759,7 +800,7 @@ export function apply(_ctx: Context, config: {
         exec,
         distro,
         linuxPath,
-        args: { command, workdir },
+        args: { command: guardedCommand, workdir },
         dshEnv,
         timeoutMs: DEFAULT_TIMEOUT_MS,
         daemonHost,
@@ -772,7 +813,7 @@ export function apply(_ctx: Context, config: {
     }
     // Bridge (or daemon-unreachable fallback): one-shot wsl.exe spawn.
     const script = [BRIDGE_ENV_BOOT, buildScript(dshEnv)].filter(Boolean).join('\n')
-    const argv = wslArgv(distro, linuxPath, script, command)
+    const argv = wslArgv(distro, linuxPath, script, guardedCommand)
     const spawnSpec = {
       argv,
       cwd: process.cwd(),
@@ -868,7 +909,7 @@ export function apply(_ctx: Context, config: {
       content: { type: 'string', required: true, description: 'Full UTF-8 text content to write.' },
     },
     async execute(args: { file_path: string; content: string }, exec: { signal: AbortSignal }): Promise<unknown> {
-      const text = await execWslText(exec, writeFileCmd(args.file_path, toBase64(args.content ?? '')))
+      const text = await execWslText(exec, writeFileCmd(args.file_path, toBase64(args.content ?? '')), undefined, undefined, { file: args.file_path, op: 'write' })
       return { text }
     },
     output: {
@@ -889,7 +930,7 @@ export function apply(_ctx: Context, config: {
       replace_all: { type: 'boolean', description: 'Replace all matches. Defaults to false; when false, old_string must appear exactly once.' },
     },
     async execute(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }, exec: { signal: AbortSignal }): Promise<unknown> {
-      const text = await execWslText(exec, editFileCmd(args.file_path, toBase64(args.old_string ?? ''), toBase64(args.new_string ?? ''), !!args.replace_all))
+      const text = await execWslText(exec, editFileCmd(args.file_path, toBase64(args.old_string ?? ''), toBase64(args.new_string ?? ''), !!args.replace_all), undefined, undefined, { file: args.file_path, op: 'edit' })
       return { text }
     },
     output: {

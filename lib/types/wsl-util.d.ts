@@ -44,3 +44,17 @@ export declare function writeFileCmd(path: string, contentB64: string): string;
  * else exactly one occurrence must match (else it errors).
  */
 export declare function editFileCmd(path: string, oldB64: string, newB64: string, replaceAll: boolean): string;
+/** Resolve a canonical (normalized, workspace-anchored) Linux path for `target`. */
+export declare function canonicalWslPath(root: string, target: string): string;
+/** True when a canonicalized target lives inside <root> (equal to root, or a descendant). */
+export declare function wslPathInside(root: string, target: string): boolean;
+/** Raise (Mark required: true — no-op) a sandbox marker when target escapes root. */
+export declare function assertWslPathInside(root: string, target: string, op: string): void;
+/**
+ * Build the bash prefix that confines the free-form `wsl` shell to the workspace
+ * root. Mutating commands are shadowed by functions that refute (exit 1 + stderr
+ * marker) any target resolving outside the root. Returns '' for an empty/rootless
+ * root (nothing to confine to — caller should not inject at all). Best-effort:
+ * `>`/`sed -i`/python writes are NOT intercepted (see header comment).
+ */
+export declare function workspaceWriteGuard(root: string): string;

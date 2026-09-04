@@ -4,7 +4,7 @@
  * full host context). No imports beyond `node:path`; nothing here touches a
  * socket, subprocess, or the daemon.
  */
-import { isAbsolute, resolve, dirname } from 'node:path'
+import { isAbsolute, resolve, dirname, posix } from 'node:path'
 
 export const DEFAULT_DISTRO = 'Ubuntu-22.04'
 export const WSL_UNC_RE = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)\\(.*)$/i
@@ -157,4 +157,84 @@ export function editFileCmd(path: string, oldB64: string, newB64: string, replac
     `print('replaced '+str(cnt)+' occurrence(s)')`,
   ].join('\n')
   return `python3 -c ${shellQuote(py)} ${file}`
+}
+
+// ---------------------------------------------------------------------------
+// Workspace-write confinement (Linux-side enforcement of the sandbox mode).
+//
+// Two layers, both pure and unit-testable:
+//
+//   1. `wslPathInside(root, target)` — the *precise* host-side check used by the
+//      structured file tools (`wsl_write`, `wsl_edit`). A discrete file_path is
+//      canonicalized and compared against the workspace root; cheap and exact.
+//   2. `workspaceWriteGuard(root)` — a bash prefix for the free-form `wsl` shell:
+//      the mutating commands (rm/mv/mkdir/touch/truncate/ln/cp-dest) are shadowed
+//      by functions that refuse any target that resolves outside the root.
+//
+// Which modes enforce: DANGER is "no interception" (current behavior); on WSL,
+// read-only is effectively workspace-write, so BOTH read-only and workspace-write
+// get this guard. Only danger-full-access passes through untouched.
+//
+// Honest boundary (surface it to the model, do not over-claim): a bash *prefix*
+// cannot intercept `>`/`>>` redirections, `sed -i`, `python open(...,'w')`, or
+// `dd of=` — those write operators are shell-syntax / embedded and escape the
+// shadowed-function net. The exact enforcement therefore lives in the structured
+// tools (wsl_write/wsl_edit use wslPathInside); the shell guard is best-effort.
+// ---------------------------------------------------------------------------
+
+/** Resolve a canonical (normalized, workspace-anchored) Linux path for `target`. */
+export function canonicalWslPath(root: string, target: string): string {
+  const r = posix.normalize(root || '/') || '/'
+  let t = toWslPath(target)
+  if (!posix.isAbsolute(t)) t = posix.resolve(r, t)
+  return posix.normalize(t)
+}
+
+/** True when a canonicalized target lives inside <root> (equal to root, or a descendant). */
+export function wslPathInside(root: string, target: string): boolean {
+  const r = posix.normalize(root || '/') || '/'
+  const t = canonicalWslPath(r, target)
+  if (t === r) return true
+  const prefix = r === '/' ? '/' : `${r}/`
+  return t.startsWith(prefix)
+}
+
+/** Raise (Mark required: true — no-op) a sandbox marker when target escapes root. */
+export function assertWslPathInside(root: string, target: string, op: string): void {
+  if (!wslPathInside(root, target)) {
+    throw new Error(`[dsh-wsl sandbox] ${op} outside the workspace root: ${target} (confined to ${root})`)
+  }
+}
+
+/**
+ * Build the bash prefix that confines the free-form `wsl` shell to the workspace
+ * root. Mutating commands are shadowed by functions that refute (exit 1 + stderr
+ * marker) any target resolving outside the root. Returns '' for an empty/rootless
+ * root (nothing to confine to — caller should not inject at all). Best-effort:
+ * `>`/`sed -i`/python writes are NOT intercepted (see header comment).
+ */
+export function workspaceWriteGuard(root: string): string {
+  const ws = posix.normalize(root || '') || ''
+  if (!ws || ws === '/' || ws === '.') return ''
+  const q = shellQuote(ws)
+  return [
+    `DSS_WS=${q}`,
+    // resolve a possibly-relative target to a canonical absolute path
+    'dss_resolve(){ local p="$1"; case "$p" in /*) ;; *) p="$(pwd 2>/dev/null || printf .)/$p";; esac; realpath -m -- "$p" 2>/dev/null || printf "%s" "$p"; }',
+    // refute a target escaping the workspace root (prints a stderr marker, exit 1)
+    'dss_in_ws(){ local r; r=$(dss_resolve "$1"); case "$r" in "$DSS_WS"|"$DSS_WS"/*) return 0;; esac; printf "[dsh-wsl sandbox] write outside workspace root: %s\\n" "$r" >&2; return 1; }',
+    // every multi-arg mutator: reject immediately on the first escaping arg
+    'dss_all(){ for a in "$@"; do case "$a" in -*) continue;; esac; dss_in_ws "$a" || return 1; done; }',
+    // single-target mutators
+    'rm(){ dss_all "$@" || return 1; command rm "$@"; }',
+    'rmdir(){ dss_all "$@" || return 1; command rmdir "$@"; }',
+    'unlink(){ dss_all "$@" || return 1; command unlink "$@"; }',
+    'mkdir(){ dss_all "$@" || return 1; command mkdir "$@"; }',
+    'touch(){ dss_all "$@" || return 1; command touch "$@"; }',
+    'truncate(){ dss_all "$@" || return 1; command truncate "$@"; }',
+    'ln(){ dss_all "$@" || return 1; command ln "$@"; }',
+    'mv(){ dss_all "$@" || return 1; command mv "$@"; }',
+    // cp: only the destination must stay inside; source(s) may be anywhere (reads allowed).
+    'cp(){ local last=; for a in "$@"; do case "$a" in -*) continue;; esac; last="$a"; done; if [ -n "$last" ]; then dss_in_ws "$last" || return 1; fi; command cp "$@"; }',
+  ].join('\n')
 }

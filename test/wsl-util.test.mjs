@@ -18,6 +18,8 @@ import {
   writeFileCmd,
   editFileCmd,
   toBase64,
+  wslPathInside,
+  workspaceWriteGuard,
   DEFAULT_DISTRO,
 } from '../lib/wsl-util.js'
 
@@ -123,5 +125,24 @@ ok('emits Python True for replace_all', () => assert.match(
   editFileCmd('/tmp/a.txt', 'b2xk', 'bmV3', true),
   /if not True and cnt!=1:/,
 ))
+
+console.log('== wslPathInside ==')
+ok('target equal to root → inside', () => assert.equal(wslPathInside('/home/crack/work', '/home/crack/work'), true))
+ok('descendant → inside', () => assert.equal(wslPathInside('/home/crack/work', '/home/crack/work/src/a.ts'), true))
+ok('outside → false', () => assert.equal(wslPathInside('/home/crack/work', '/etc/passwd'), false))
+ok('sibling under shared prefix → false', () => assert.equal(wslPathInside('/home/crack/work', '/home/crack/other'), false))
+ok('prefix-prefix trap (work vs workspace) → false', () => assert.equal(wslPathInside('/home/crack/work', '/home/crack/workspace/x'), false))
+ok('relative target resolves against root → inside', () => assert.equal(wslPathInside('/home/crack/work', 'src/a.ts'), true))
+ok('UNC target resolves via toWslPath → inside', () => assert.equal(wslPathInside('/home/crack/work', '\\\\wsl.localhost\\Ubuntu-22.04\\home\\crack\\work\\a.ts'), true))
+ok('root "/" admits anything', () => assert.equal(wslPathInside('/', '/tmp/x'), true))
+
+console.log('== workspaceWriteGuard ==')
+ok('empty for empty root', () => assert.equal(workspaceWriteGuard(''), ''))
+ok('empty for rootless', () => assert.equal(workspaceWriteGuard('.'), ''))
+ok('contains DSS_WS root', () => assert.match(workspaceWriteGuard('/home/crack/work'), /DSS_WS='\/home\/crack\/work'/))
+ok('shadows rm', () => assert.match(workspaceWriteGuard('/home/crack/work'), /rm\(\)\{ dss_all .*; command rm/) )
+ok('shadows mkdir', () => assert.match(workspaceWriteGuard('/home/crack/work'), /mkdir\(\)\{ dss_all .*; command mkdir/) )
+ok('shadows cp (dest-limited)', () => assert.match(workspaceWriteGuard('/home/crack/work'), /cp\(\)\{ local last=.*; command cp/) )
+ok('shadows an escaping-write stderr marker', () => assert.match(workspaceWriteGuard('/home/crack/work'), /write outside workspace root/) )
 
 console.log(`\n${passed} assertions passed`)
