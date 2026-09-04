@@ -14,6 +14,10 @@ import {
   resolveWorkdir,
   readWindowCmd,
   grepCmd,
+  globFindCmd,
+  writeFileCmd,
+  editFileCmd,
+  toBase64,
   DEFAULT_DISTRO,
 } from '../lib/wsl-util.js'
 
@@ -85,6 +89,31 @@ ok('maps include to rg --glob and grep --include', () => assert.match(
 ok('shell-quotes path argument', () => assert.match(
   grepCmd('x', '/a b'),
   / '\/a b' \|\| grep -RnE 'x' '\/a b'/,
+))
+
+console.log('== toBase64 ==')
+ok('round-trips text', () => assert.equal(Buffer.from(toBase64('hi\n世界'), 'base64').toString('utf8'), 'hi\n世界'))
+
+console.log('== globFindCmd ==')
+ok('cds into the dir and enables globstar', () => assert.match(
+  globFindCmd('/tmp', '**/*.ts'),
+  /cd '\/tmp'.*shopt -s globstar nullglob/,
+))
+
+console.log('== writeFileCmd ==')
+ok('mks dir and writes base64-decoded content', () => assert.match(
+  writeFileCmd('/tmp/d/a.txt', 'aGVsbG8='),
+  /mkdir -p '\/tmp\/d'.*printf '%s' 'aGVsbG8=' \| base64 -d > '\/tmp\/d\/a.txt'/,
+))
+
+console.log('== editFileCmd ==')
+ok('invokes python3 with base64 old/new', () => assert.match(
+  editFileCmd('/tmp/a.txt', 'b2xk', 'bmV3', false),
+  /python3 -c '[\s\S]*base64\.b64decode\([^)]*b2xk[^)]*\)/,
+))
+ok('uses replace() with replace_all', () => assert.match(
+  editFileCmd('/tmp/a.txt', 'b2xk', 'bmV3', true),
+  /s=s\.replace\(old,new\)/,
 ))
 
 console.log(`\n${passed} assertions passed`)

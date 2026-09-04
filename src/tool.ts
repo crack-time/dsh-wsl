@@ -37,10 +37,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   buildScript,
   distroOf,
+  editFileCmd,
+  globFindCmd,
   grepCmd,
   readWindowCmd,
+  toBase64,
   toWslPath,
   wslArgv,
+  writeFileCmd,
   resolveWorkdir,
   shellQuote,
   DEFAULT_DISTRO,
@@ -826,6 +830,65 @@ export function apply(_ctx: Context, config: {
     },
     async execute(args: { pattern: string; path?: string; include?: string }, exec: { signal: AbortSignal }): Promise<unknown> {
       const text = await execWslText(exec, grepCmd(args.pattern, args.path, args.include))
+      return { text }
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
+      render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    },
+  } as never))
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_glob',
+    description: 'Find files inside the WSL distro whose paths match a glob pattern. ' +
+      'Like the native glob tool but runs in WSL (native glob is disabled on this preset). ' +
+      'Bash globstar: a pattern with no "/" matches basenames at any depth; include a separator to anchor.',
+    parameters: {
+      pattern: { type: 'string', required: true, description: 'Glob pattern to match, e.g. "**/*.ts", "*.out".' },
+      path: { type: 'string', description: 'Directory to search inside the WSL distro. Defaults to the session workspace.' },
+    },
+    async execute(args: { pattern: string; path?: string }, exec: { signal: AbortSignal }): Promise<unknown> {
+      const text = await execWslText(exec, globFindCmd(args.path ?? '', args.pattern))
+      return { text }
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
+      render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    },
+  } as never))
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_write',
+    description: 'Create or fully replace a text file inside the WSL distro. ' +
+      'Like the native write tool but runs in WSL (native write is disabled on this preset). ' +
+      'Content is base64-encoded across the bridge so multi-line text survives intact.',
+    parameters: {
+      file_path: { type: 'string', required: true, description: 'Path to write inside the WSL distro.' },
+      content: { type: 'string', required: true, description: 'Full UTF-8 text content to write.' },
+    },
+    async execute(args: { file_path: string; content: string }, exec: { signal: AbortSignal }): Promise<unknown> {
+      const text = await execWslText(exec, writeFileCmd(args.file_path, toBase64(args.content ?? '')))
+      return { text }
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
+      render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    },
+  } as never))
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_edit',
+    description: 'Edit an existing text file inside the WSL distro by replacing literal text. ' +
+      'Like the native edit tool but runs in WSL (native edit is disabled on this preset). ' +
+      'old_string/new_string are base64-encoded across the bridge. By default old_string must appear exactly once.',
+    parameters: {
+      file_path: { type: 'string', required: true, description: 'Path to edit inside the WSL distro.' },
+      old_string: { type: 'string', required: true, description: 'Literal text to replace. Must match exactly.' },
+      new_string: { type: 'string', required: true, description: 'Literal replacement text. Use an empty string to delete the match.' },
+      replace_all: { type: 'boolean', description: 'Replace all matches. Defaults to false; when false, old_string must appear exactly once.' },
+    },
+    async execute(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }, exec: { signal: AbortSignal }): Promise<unknown> {
+      const text = await execWslText(exec, editFileCmd(args.file_path, toBase64(args.old_string ?? ''), toBase64(args.new_string ?? ''), !!args.replace_all))
       return { text }
     },
     output: {

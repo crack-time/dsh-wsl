@@ -32,3 +32,15 @@ export declare function buildScript(modelFriendlyEnv: Record<string, string>): s
  * session cwd; absent → the session cwd.
  */
 export declare function resolveWorkdir(modelWorkdir: string | undefined, sessionCwd: string | undefined): string | undefined;
+/** Base64-encode text (stable cross-platform; Buffer is a Node global). */
+export declare function toBase64(text: string): string;
+/** A `wsl_glob`: expand a glob under a dir and print matching regular files. */
+export declare function globFindCmd(path: string, pattern: string): string;
+/** A `wsl_write`: create/overwrite a file whose content is base64-encoded. */
+export declare function writeFileCmd(path: string, contentB64: string): string;
+/**
+ * A `wsl_edit`: replace old/new in a file. old/new travel base64-encoded to
+ * dodge quoting; decoded by python3. `replaceAll` toggles a global replace,
+ * else exactly one occurrence must match (else it errors).
+ */
+export declare function editFileCmd(path: string, oldB64: string, newB64: string, replaceAll: boolean): string;
