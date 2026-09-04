@@ -52,9 +52,10 @@ export declare function wslPathInside(root: string, target: string): boolean;
 export declare function assertWslPathInside(root: string, target: string, op: string): void;
 /**
  * Build the bash prefix that confines the free-form `wsl` shell to the workspace
- * root. Mutating commands are shadowed by functions that refute (exit 1 + stderr
- * marker) any target resolving outside the root. Returns '' for an empty/rootless
- * root (nothing to confine to — caller should not inject at all). Best-effort:
- * `>`/`sed -i`/python writes are NOT intercepted (see header comment).
+ * root. The SIMPLE write/copy/delete primitives are shadowed by functions that
+ * refute (exit 1 + stderr marker) any target resolving outside the root. Complex
+ * embedded writers (`>`/`sed -i`/python open/dd/tee/archives) are deliberately
+ * not intercepted — see the module header for the intended scope. Returns '' for
+ * an empty/rootless root (nothing to confine to — caller should not inject).
  */
 export declare function workspaceWriteGuard(root: string): string;
