@@ -808,7 +808,10 @@ export function apply(_ctx: Context, config: {
       const text = await execWslText(exec, readWindowCmd(args.file_path, args.offset, args.limit))
       return { text }
     },
-    render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
+      render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    },
   } as never))
 
   ctx.tools.register(defineTool({
@@ -825,6 +828,9 @@ export function apply(_ctx: Context, config: {
       const text = await execWslText(exec, grepCmd(args.pattern, args.path, args.include))
       return { text }
     },
-    render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } }, required: ['text'] },
+      render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+    },
   } as never))
 }
