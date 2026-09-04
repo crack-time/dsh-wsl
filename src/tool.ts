@@ -538,7 +538,14 @@ export function apply(_ctx: Context, config: {
     // (throwing "order must be a finite number"), so pass a literal 1000 to sit
     // beside the tool-bash/pwsh guidance (equal orders break by name).
     order: 1000,
-    text: 'Check the [exit code: N] marker on every wsl result; investigate failures before moving on.',
+    // The native file tools (read/write/edit/glob/grep) run on the Windows host,
+    // so on a WSL-UNC workspace they can't work against the share (write/edit
+    // fail on atomic rename ENOTSUP; grep fails with ripgrep os error 3). The
+    // standard-wsl preset DISABLES them entirely, so every file operation must
+    // go through `wsl` (bash).
+    text: 'Check the [exit code: N] marker on every wsl result; investigate failures before moving on. ' +
+      'This session runs on a WSL workspace: the native file tools (read, write, edit, glob, grep) are DISABLED here ' +
+      '— do all file reads, writes, edits and searches with the wsl tool (bash) instead.',
   })
 
   ctx.tools.register(defineTool({

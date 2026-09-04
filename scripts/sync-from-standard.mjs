@@ -155,6 +155,20 @@ function transform(standardAgentYml, distro) {
       continue
     }
 
+    // Disable the native filesystem tools entirely: on a WSL-UNC workspace the
+    // host file tools can't write (atomic rename ENOTSUP) or grep (ripgrep
+    // os error 3) against the share. `tool-fs` bundles read/write/edit and
+    // `tool-fs-search` bundles glob+grep, so disabling the whole row is the
+    // only granularity the loader offers — the model must use `wsl` (bash) for
+    // every file operation. Inject a `disabled:` row right after the `name:` of
+    // each package (these rows carry no existing `disabled:` to rewrite).
+    if ((currentId === 'tool-fs' || currentId === 'tool-fs-search') &&
+        /^ {2}name:\s*['"]@deepseek-ai\/dsh-tool-fs(-search)?['"]\s*$/.test(line)) {
+      out.push(line)
+      out.push('  disabled: true')
+      continue
+    }
+
     out.push(line)
   }
 
