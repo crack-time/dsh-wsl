@@ -37,6 +37,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   buildScript,
   distroOf,
+  grepCmd,
+  readWindowCmd,
   toWslPath,
   wslArgv,
   resolveWorkdir,
@@ -544,8 +546,8 @@ export function apply(_ctx: Context, config: {
     // standard-wsl preset DISABLES them entirely, so every file operation must
     // go through `wsl` (bash).
     text: 'Check the [exit code: N] marker on every wsl result; investigate failures before moving on. ' +
-      'This session runs on a WSL workspace: the native file tools (read, write, edit, glob, grep) are DISABLED here ' +
-      '— do all file reads, writes, edits and searches with the wsl tool (bash) instead.',
+      'This session runs on a WSL workspace: the native file tools (read, write, edit, glob, grep) are DISABLED here. ' +
+      'Read files with `wsl_read`, search with `wsl_grep`, and run arbitrary shell commands with `wsl`.',
   })
 
   ctx.tools.register(defineTool({
@@ -731,5 +733,98 @@ export function apply(_ctx: Context, config: {
     },
     presentCall: (args: { command: string; description: string }) => ({ card: 'terminal', title: args.command, description: args.description }),
     presentResult: presentResult as never,
+  } as never))
+
+  // ── Structured file sub-tools ────────────────────────────────────────────
+  // Execute one computed bash command through the same daemon-first backend,
+  // returning the rendered foreground text (or the bridge fallback note).
+  async function execWslText(exec: { signal: AbortSignal }, command: string, workdirArg?: string, envArg?: Record<string, string | undefined>): Promise<string> {
+    const sessionCwd = (exec as { agent?: { session: { header: { cwd?: string } } } }).agent?.session?.header?.cwd
+    const workdir = resolveWorkdir(workdirArg, sessionCwd)
+    const distro = distroOf(workdir, configuredDistro)
+    const linuxPath = toWslPath(workdir ?? '')
+    let dshEnv = ctx.shellEnv.collect(exec) as Record<string, string>
+    if (envArg) {
+      for (const [k, v] of Object.entries(envArg)) if (typeof v === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) dshEnv[k] = v
+    }
+    let fallbackNote: string | undefined
+    if (daemonEnabled) {
+      const outcome = await runDaemonForegroundBackend({
+        ctx: ctx as never,
+        exec,
+        distro,
+        linuxPath,
+        args: { command, workdir },
+        dshEnv,
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        daemonHost,
+        daemonPort,
+        daemonToken,
+        daemonAutoStart,
+      })
+      if ('value' in outcome) return renderResult(outcome.value)
+      fallbackNote = outcome.note
+    }
+    // Bridge (or daemon-unreachable fallback): one-shot wsl.exe spawn.
+    const script = [BRIDGE_ENV_BOOT, buildScript(dshEnv)].filter(Boolean).join('\n')
+    const argv = wslArgv(distro, linuxPath, script, command)
+    const spawnSpec = {
+      argv,
+      cwd: process.cwd(),
+      stdio: {
+        stdin: 'ignore' as const,
+        stdout: collect(DEFAULT_MAX_OUTPUT_BYTES),
+        stderr: collect(DEFAULT_MAX_OUTPUT_BYTES),
+      },
+      graceMs: DEFAULT_GRACE_MS,
+      env: envArg,
+      signal: exec.signal,
+    }
+    const d = deadline(exec.signal, DEFAULT_TIMEOUT_MS, TIMEOUT_CODE)
+    try {
+      const handle = ctx.subprocess.spawn(spawnSpec)
+      const outcome = await handle.done
+      const timedOut = timeoutOf(d.signal, TIMEOUT_CODE) !== void 0
+      const stdout = handle.collected.stdout ? finalOutput(handle.collected.stdout) : { text: '', truncated: false }
+      const stderr = handle.collected.stderr ? finalOutput(handle.collected.stderr) : { text: '', truncated: false }
+      if (fallbackNote) stdout.text = `${fallbackNote}\n${stdout.text}`
+      return renderResult({ exitCode: outcome.exitCode, signal: outcome.signal, timedOut, timeoutMs: DEFAULT_TIMEOUT_MS, stdout, stderr })
+    } finally {
+      d[Symbol.dispose]()
+    }
+  }
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_read',
+    description: 'Read a text file inside the WSL distro and return line-numbered content. ' +
+      'Like the native read tool but runs in WSL (native read is disabled on this preset). ' +
+      'Path is a Linux path or a WSL UNC workspace path; it is translated into the distro automatically.',
+    parameters: {
+      file_path: { type: 'string', required: true, description: 'Path to read inside the WSL distro.' },
+      offset: { type: 'number', description: '1-based first line to return. Defaults to 1.' },
+      limit: { type: 'number', description: 'Max number of lines to return. Defaults to the whole file.' },
+    },
+    async execute(args: { file_path: string; offset?: number; limit?: number }, exec: { signal: AbortSignal }): Promise<unknown> {
+      const text = await execWslText(exec, readWindowCmd(args.file_path, args.offset, args.limit))
+      return { text }
+    },
+    render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
+  } as never))
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_grep',
+    description: 'Search files inside the WSL distro with a regular expression and return matching lines. ' +
+      'Like the native grep tool but runs in WSL (native grep is disabled on this preset). ' +
+      'Uses ripgrep if installed, else grep -rnE. Path defaults to the current workspace.',
+    parameters: {
+      pattern: { type: 'string', required: true, description: 'Regular expression to search for (ripgrep/grep -E syntax).' },
+      path: { type: 'string', description: 'File or directory to search inside the WSL distro. Defaults to the session workspace.' },
+      include: { type: 'string', description: 'Glob filter for which files to search (e.g. "*.ts", "*.{js,jsx}").' },
+    },
+    async execute(args: { pattern: string; path?: string; include?: string }, exec: { signal: AbortSignal }): Promise<unknown> {
+      const text = await execWslText(exec, grepCmd(args.pattern, args.path, args.include))
+      return { text }
+    },
+    render: (_a: unknown, v: { text: string }) => [{ type: 'text', text: v.text }],
   } as never))
 }

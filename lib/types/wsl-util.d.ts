@@ -2,6 +2,18 @@ export declare const DEFAULT_DISTRO = "Ubuntu-22.04";
 export declare const WSL_UNC_RE: RegExp;
 export declare const DEFAULT_TIMEOUT_MS = 120000;
 export declare const MAX_TIMEOUT_MS = 600000;
+/**
+ * A saved window (1-based lines) for a structured `wsl_read`. Pure — returns
+ * the bash `-lc` payload; no I/O here. Missing file → non-zero exit with a
+ * clear message. Emits `[wsl_read] lines: <total>` so the model can page.
+ */
+export declare function readWindowCmd(path: string, offset?: number, limit?: number): string;
+/**
+ * A structured `wsl_grep`. Pure — returns the bash `-lc` payload. Prefers
+ * `rg` when installed, else `grep -rnE`. `include` maps to ripgrep `--glob`
+ * (or a find-style `-name` for grep). Pattern and paths are shell-quoted.
+ */
+export declare function grepCmd(pattern: string, path?: string, include?: string): string;
 /** Single-quote a value for safe interpolation into a bash `-c` style block. */
 export declare function shellQuote(value: string): string;
 /** True when a workdir points into a WSL distro via its UNC share. */

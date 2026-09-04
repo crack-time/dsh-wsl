@@ -12,6 +12,8 @@ import {
   wslArgv,
   buildScript,
   resolveWorkdir,
+  readWindowCmd,
+  grepCmd,
   DEFAULT_DISTRO,
 } from '../lib/wsl-util.js'
 
@@ -55,5 +57,34 @@ console.log('== resolveWorkdir ==')
 ok('win32 absolute passthrough', () => assert.equal(resolveWorkdir('C:\\abc', 'D:\\ws'), 'C:\\abc'))
 ok('relative joins on session cwd', () => assert.equal(resolveWorkdir('sub', 'C:\\ws\\root'), 'C:\\ws\\root\\sub'))
 ok('absent returns session cwd', () => assert.equal(resolveWorkdir(undefined, 'C:\\ws'), 'C:\\ws'))
+
+console.log('== readWindowCmd ==')
+ok('defaults to whole file (window 1-)', () => assert.match(
+  readWindowCmd('/tmp/a b.txt'),
+  /awk 'NR>=1&&NR<=9007199254740991/,
+))
+ok('carries offset/limit into awk window', () => assert.match(
+  readWindowCmd('/tmp/x', 5, 20),
+  /awk 'NR>=5&&NR<=24/,
+))
+ok('shell-quotes the path', () => assert.match(readWindowCmd("/tmp/it's"), /\[ ! -f '\/tmp\/it'\\''s' \]/))
+ok('emits line-count footer', () => assert.match(
+  readWindowCmd('/tmp/x', 1, 10),
+  /WC=\$\(wc -l < '\/tmp\/x'\)/,
+))
+
+console.log('== grepCmd ==')
+ok('prefers rg with grep fallback', () => assert.match(
+  grepCmd('TODO'),
+  /command -v rg.*&& rg -n --no-heading 'TODO' '\.' \|\| grep -RnE 'TODO' '\.'/,
+))
+ok('maps include to rg --glob and grep --include', () => assert.match(
+  grepCmd('x', '/src', '*.ts'),
+  /--glob '\*\.ts'/,
+))
+ok('shell-quotes path argument', () => assert.match(
+  grepCmd('x', '/a b'),
+  / '\/a b' \|\| grep -RnE 'x' '\/a b'/,
+))
 
 console.log(`\n${passed} assertions passed`)
